@@ -36,6 +36,7 @@ python -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --icon=yhkt.ico ^
+    --add-data="yhkt.ico;." ^
     --hidden-import=customtkinter ^
     --hidden-import=PIL ^
     --hidden-import=_tkinter ^

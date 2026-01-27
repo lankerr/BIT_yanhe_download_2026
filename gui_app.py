@@ -16,6 +16,16 @@ import logging
 import traceback
 from typing import Optional, List, Dict, Callable
 
+
+def get_resource_path(relative_path):
+    """获取资源文件的绝对路径，支持打包后的环境"""
+    try:
+        # PyInstaller 创建临时文件夹，将路径存储在 _MEIPASS
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 # 配置日志 - 同时输出到控制台和文件
 logging.basicConfig(
     level=logging.DEBUG,
@@ -770,7 +780,10 @@ class DownloadFrame(ctk.CTkFrame):
         # 更新状态
         status_text = ""
         status_color = "#8b949e"
-        if status == 0:  # 下载中
+        if status == -2:  # 获取视频信息中
+            status_text = "正在获取视频信息..."
+            status_color = G_ACCENT
+        elif status == 0:  # 下载中
             status_text = f"下载中: {downloaded}/{total}"
             status_color = G_WARN
         elif status == 1:  # 合并中
@@ -965,6 +978,17 @@ class YanheDownloaderApp(ctk.CTk):
         self.title("延河课堂下载器 - Enhanced Edition")
         self.geometry("900x700")
         self.minsize(800, 600)
+        
+        # 设置窗口图标
+        try:
+            icon_path = get_resource_path("yhkt.ico")
+            if os.path.exists(icon_path):
+                self.iconbitmap(icon_path)
+                logger.info(f"窗口图标设置成功: {icon_path}")
+            else:
+                logger.warning(f"图标文件不存在: {icon_path}")
+        except Exception as e:
+            logger.warning(f"设置窗口图标失败: {e}")
 
         self.configure(fg_color=G_BG)
         

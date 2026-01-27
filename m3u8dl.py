@@ -104,10 +104,20 @@ class M3u8Download:
         urllib3.disable_warnings()
 
 
-
         self._url = utils.encryptURL(self._url)
+        
+        # 通知 GUI 正在获取视频信息 (status=-2 表示正在初始化)
+        self._progress_callback(0, 0, -2, 0, 0)
+        print(f"[M3u8Download] 开始获取 m3u8 信息: {self._name}")
 
         self.get_m3u8_info(self._url, self._num_retries)
+        
+        # 检查是否成功获取到 ts 列表
+        if self._ts_sum == 0:
+            print(f"[M3u8Download] 警告: 未获取到任何 ts 文件")
+            raise Exception("无法获取视频信息，请检查网络或 Token 是否有效")
+        
+        print(f"[M3u8Download] 成功获取 {self._ts_sum} 个 ts 文件")
 
         # signal 只能在主线程中使用，GUI模式下跳过
         if not self._gui_mode:
