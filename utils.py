@@ -22,10 +22,11 @@ headers = {
 def auth_prompt(code=True):
     return [
         "请先在浏览器登录延河课堂",
-        "并在延河课堂的地址栏输入 javascript:alert(JSON.parse(localStorage.auth).token)",
-        '注意粘贴时浏览器会自动去掉"javascript:"，需要手动补上',
-        "或者按F12打开控制台粘贴这段代码",
-        "然后将弹出的内容粘贴到" + ("这里：" if code else '"身份认证码"栏'),
+        "然后按F12打开控制台，输入以下代码：",
+        "  javascript:alert(JSON.parse(localStorage.auth).token)",
+        "或者直接输入: JSON.parse(localStorage.auth).token",
+        "复制弹出的认证码（32位字符）",
+        "粘贴到" + ("这里：" if code else '"身份认证码"栏'),
     ]
 
 
@@ -102,6 +103,7 @@ def test_auth(courseID):
     res = requests.get(
         f"https://cbiz.yanhekt.cn/v2/course/session/list?course_id={courseID}",
         headers=headers,
+        timeout=(10, 30),  # 连接10秒，读取30秒
     )
     return bool(res.json()["data"])
 
@@ -112,10 +114,12 @@ def get_course_info(courseID):
     course = requests.get(
         f"https://cbiz.yanhekt.cn/v1/course?id={courseID}&with_professor_badges=true",
         headers=headers,
+        timeout=(10, 30),
     )
     res = requests.get(
         f"https://cbiz.yanhekt.cn/v2/course/session/list?course_id={courseID}",
         headers=headers,
+        timeout=(10, 30),
     )
 
     if course.json()["code"] != "0" and course.json()["code"] != 0:

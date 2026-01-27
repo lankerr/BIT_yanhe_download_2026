@@ -1,3 +1,4 @@
 requests
 windows-curses
 Flask
+customtkinter

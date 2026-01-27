@@ -1,14 +1,41 @@
+# Python缓存
 __pycache__/
-output/
+*.pyc
+*.pyo
+
+# 输出目录
+output/*
+!output/*.md
+!output/**/*.md
+
+# 临时文件
 old/
 *.zip
-*.exe
+*.log
+
+# 打包相关
 build/
 dist/
 *.spec
+
+# 模型文件
 whisper_models/
-release_*/
-*.json
+
+# IDE
 .idea
 .DS_Store
+*.json
 auth.txt
+
+# ================================
+# 以下功能开发中，暂不上传
+# ================================
+# 课件提取
+keyframes_to_pdf.py
+# 音频转录
+transcribe_cuda.py
+transcribe_maas.py
+local_transcribe_batch.py
+# FFmpeg
+ffmpeg.exe
+ffprobe.exe

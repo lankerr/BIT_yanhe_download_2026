@@ -12,6 +12,7 @@ import requests
 import urllib3
 
 import utils
+import threading
 
 
 class ThreadPoolExecutorWithQueueSizeLimit(ThreadPoolExecutor):
@@ -32,7 +33,7 @@ def make_sum():
         ts_num += 1
 
 
-def dummy_func(downloaded, total, merge_status):
+def dummy_func(downloaded, total, merge_status, active_threads=0, max_threads=0):
     return
 
 
@@ -50,18 +51,26 @@ class M3u8Download:
         url,
         workDir,
         name,
-        max_workers=32,
+        max_workers=128,
         num_retries=99,
         base64_key=None,
         progress_callback=dummy_func,
+        gui_mode=False,
     ):
         self._url = url
         self._token = None
         self._workDir = workDir
         self._name = name
-        self._max_workers = max_workers
+        self._max_workers = min(max_workers, 64) # Cap at 64 to avoid overhead
+        self._current_max_workers = 16 # Slow Start
         self._num_retries = num_retries
         self._progress_callback = progress_callback
+        
+        # Adaptive Watchdog: 增加超时时间适应网络波动
+        self._watchdog_timeout = 120  # 增加到120秒
+        self._gui_mode = gui_mode
+        self._watchdog_triggered = False
+        
         if not os.path.exists(os.path.join(os.getcwd(), self._workDir)):
             os.makedirs(os.path.join(os.getcwd(), self._workDir))
         self._file_path = os.path.join(os.getcwd(), self._workDir, self._name)
@@ -74,6 +83,18 @@ class M3u8Download:
         self._success_sum = 0
         self._ts_sum = 0
         self._key = base64.b64decode(base64_key.encode()) if base64_key else None
+        self._last_activity_time = time.time()
+        self._downloading = True
+        self._ts_locks = set()  # 锁定正在下载的ts文件
+        self._ts_lock_mutex = threading.Lock()  # 保护_ts_locks的互斥锁
+        self._watchdog_thread = threading.Thread(target=self.watchdog, daemon=True)
+        self._watchdog_thread.start()
+        
+        # Adaptive threading control
+        # self._current_max_workers initialized in __init__
+        self._active_threads = 0
+        self._thread_cond = threading.Condition()
+        self._min_workers = 1
         self._headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/93.0.4577.82 Safari/537.36 Edg/93.0.961.52",
             "Origin": "https://www.yanhekt.cn",
@@ -82,17 +103,28 @@ class M3u8Download:
         self.timestamp, self.signature = utils.getSignature()
         urllib3.disable_warnings()
 
+
+
         self._url = utils.encryptURL(self._url)
 
         self.get_m3u8_info(self._url, self._num_retries)
 
-        def signal_handler(sig, frame):
-            print("Caught KeyboardInterrupt. Shutting down...")
-            os._exit(1)
+        # signal 只能在主线程中使用，GUI模式下跳过
+        if not self._gui_mode:
+            def signal_handler(sig, frame):
+                print("Caught KeyboardInterrupt. Shutting down...")
+                os._exit(1)
 
-        signal.signal(signal.SIGINT, signal_handler)
+            try:
+                signal.signal(signal.SIGINT, signal_handler)
+            except ValueError:
+                # 不在主线程中，忽略
+                pass
+        
         print(f"Downloading: {self._name}", f"Save path: {self._file_path}", sep="\n")
-        with ThreadPoolExecutorWithQueueSizeLimit(self._max_workers) as pool:
+        
+        # Use a larger pool size to allow queuing, but control execution with condition variable
+        with ThreadPoolExecutorWithQueueSizeLimit(self._max_workers * 2) as pool:
             pool.submit(self.updateSignatureLoop)
             for k, ts_url in enumerate(self._ts_url_list):
                 pool.submit(
@@ -109,7 +141,29 @@ class M3u8Download:
             self.output_mp4()
             self.delete_file()
             print(f"Download successfully --> {self._name}")
+            with open("debug.log", "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {self._name} COMPLETED. Final Threads: {self._current_max_workers}\n")
             self._progress_callback(self._success_sum, self._ts_sum, 2)
+        else:
+            print(f"Download failed or incomplete for {self._name}. Success: {self._success_sum}, Total: {self._ts_sum}")
+            raise Exception(f"Download incomplete: {self._success_sum}/{self._ts_sum}")
+        self._downloading = False
+
+    def watchdog(self):
+        while self._downloading:
+            time.sleep(5)
+            # Use the adaptive timeout value
+            if time.time() - self._last_activity_time > self._watchdog_timeout:
+                print(f"\n[Watchdog] Download hung for {self._watchdog_timeout}s!")
+                self._watchdog_triggered = True
+                if self._gui_mode:
+                    # GUI模式下不强制退出，只是设置标记
+                    print("[Watchdog] GUI mode - marking download as failed")
+                    self._downloading = False
+                    return
+                else:
+                    print("Exiting with code 100 to restart...")
+                    os._exit(100)
 
     def updateSignatureLoop(self):
         while self._success_sum != self._ts_sum:
@@ -185,51 +239,122 @@ class M3u8Download:
         with open(self._file_path + ".m3u8", "wb") as f:
             f.write(new_m3u8_str.encode("utf-8"))
 
+    def _acquire_slot(self):
+        with self._thread_cond:
+            while self._active_threads >= self._current_max_workers:
+                self._thread_cond.wait()
+            self._active_threads += 1
+
+    def _release_slot(self, success=True):
+        with self._thread_cond:
+            self._active_threads -= 1
+            if success:
+                # Additive Increase
+                if self._current_max_workers < self._max_workers:
+                    old = self._current_max_workers
+                    self._current_max_workers += 1
+                    if old != self._current_max_workers:
+                        with open("debug.log", "a", encoding="utf-8") as f:
+                            f.write(f"[{time.strftime('%H:%M:%S')}] INCREASE Threads: {old} -> {self._current_max_workers} (Total TS: {self._ts_sum})\n")
+            else:
+                # Multiplicative Decrease
+                old = self._current_max_workers
+                self._current_max_workers = max(self._min_workers, self._current_max_workers // 2)
+                if old != self._current_max_workers:
+                     with open("debug.log", "a", encoding="utf-8") as f:
+                        f.write(f"[{time.strftime('%H:%M:%S')}] DECREASE Threads: {old} -> {self._current_max_workers} (Failure detected)\n")
+            self._thread_cond.notify_all()
+
     def download_ts(self, ts_url_original: str, name: str, num_retries: int) -> None:
         """
         下载 .ts 文件
         """
-        if not self._token:
-            self._token = utils.getToken()
-        token = self._token
-        ts_url = utils.add_signature_for_url(
-            ts_url_original.split("\n")[0], token, self.timestamp, self.signature
-        )
+        # Acquire slot before starting work
+        self._acquire_slot()
         try:
+            if not self._token:
+                self._token = utils.getToken()
+            token = self._token
+            ts_url = utils.add_signature_for_url(
+                ts_url_original.split("\n")[0], token, self.timestamp, self.signature
+            )
+            
+            # 检查是否已经有其他线程在下载此文件
+            with self._ts_lock_mutex:
+                if name in self._ts_locks:
+                    return  # 其他线程正在下载，跳过
+                self._ts_locks.add(name)
+            
             if not os.path.exists(name):
-                with requests.get(
-                    ts_url,
-                    stream=True,
-                    timeout=(5, 60),
-                    verify=False,
-                    headers=self._headers,
-                ) as res:
-                    if res.status_code == 200:
-                        with open(name, "wb") as ts:
-                            for chunk in res.iter_content(chunk_size=1024):
-                                if chunk:
-                                    ts.write(chunk)
-                        self._success_sum += 1
-                        sys.stdout.write(
-                            "\r[%-25s](%d/%d)"
-                            % (
-                                "*" * (100 * self._success_sum // self._ts_sum // 4),
-                                self._success_sum,
-                                self._ts_sum,
+                try:
+                    with requests.get(
+                        ts_url,
+                        stream=True,
+                        timeout=(5, 60),
+                        verify=False,
+                        headers=self._headers,
+                    ) as res:
+                        if res.status_code == 200:
+                            with open(name, "wb") as ts:
+                                for chunk in res.iter_content(chunk_size=1024):
+                                    if chunk:
+                                        ts.write(chunk)
+                            
+                            # Validate file size
+                            if os.path.getsize(name) < 1024:
+                                raise Exception(f"Downloaded file too small ({os.path.getsize(name)} bytes)")
+
+                            self._last_activity_time = time.time()
+                            self._success_sum += 1
+                            sys.stdout.write(
+                                "\r[%-25s](%d/%d) threads:%d/%d"
+                                % (
+                                    "*" * (100 * self._success_sum // self._ts_sum // 4),
+                                    self._success_sum,
+                                    self._ts_sum,
+                                    self._active_threads,
+                                    self._current_max_workers
+                                )
                             )
-                        )
-                        sys.stdout.flush()
-                    else:
-                        self.download_ts(ts_url_original, name, num_retries - 1)
+                            sys.stdout.flush()
+                        else:
+                            # Not a success 200, reduce threads
+                            raise Exception(f"Status {res.status_code}")
+                except Exception as e:
+                     # Handled in outer except
+                     raise e
             else:
                 self._success_sum += 1
 
-            self._progress_callback(self._success_sum, self._ts_sum, 0)
+            self._progress_callback(self._success_sum, self._ts_sum, 0, self._active_threads, self._current_max_workers)
+            
         except Exception:
+            # Failure case
+            self._release_slot(success=False)
             if os.path.exists(name):
                 os.remove(name)
             if num_retries > 0:
+                # Recurse. Note: Recursion will call download_ts which acquires a NEW slot.
+                # This corresponds to "retrying later"
+                # Exponential backoff: wait before retrying
+                # attempt = self._num_retries - num_retries
+                # Wait: 2^attempt, capped at 30s
+                # User request: "Linearly increase exponential backoff" - mixing logic slightly or just standard exp.
+                # "每一个加一个" -> implies checking per item.
+                attempt = self._num_retries - num_retries
+                wait_time = min(30, 2 ** attempt)
+                print(f"Retrying {name} in {wait_time}s (Left: {num_retries})...")
+                time.sleep(wait_time)
                 self.download_ts(ts_url_original, name, num_retries - 1)
+            return # IMPORTANT: Return here to avoid double release
+
+        finally:
+            # 释放锁
+            with self._ts_lock_mutex:
+                self._ts_locks.discard(name)
+        
+        # Success case release (if we got here, we didn't recurse or return early)
+        self._release_slot(success=True)
 
     def download_key(self, key_line, num_retries):
         """
@@ -266,17 +391,22 @@ class M3u8Download:
         """
         合并.ts文件，输出mp4格式视频，需要ffmpeg
         """
-        run(
-            [
-                "ffmpeg",
-                "-i", f"{self._file_path}.m3u8",
-                "-acodec", "copy",
-                "-vcodec", "copy",
-                "-f", "mp4",
-                f"{self._file_path}.mp4",
-            ],
-            check=True,
-        )
+        # Check for local ffmpeg
+        ffmpeg_cmd = "ffmpeg"
+        if os.path.exists("ffmpeg.exe"):
+            ffmpeg_cmd = os.path.abspath("ffmpeg.exe")
+            
+        cmd = [
+            ffmpeg_cmd,
+            "-i", f"{self._file_path}.m3u8",
+            "-acodec", "copy",
+            "-vcodec", "copy",
+            "-f", "mp4",
+            f"{self._file_path}.mp4",
+        ]
+        
+        # print("Executing FFmpeg:", " ".join(cmd))
+        run(cmd, check=True)
 
     def delete_file(self):
         file = os.listdir(self._file_path)
