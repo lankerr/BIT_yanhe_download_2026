@@ -6,7 +6,7 @@
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, filedialog
 import threading
 import queue
 import os
@@ -69,13 +69,14 @@ G_ERROR = "#f85149"
 
 class DownloadTask:
     """下载任务类"""
-    def __init__(self, session_info: dict, course_name: str, professor: str, 
-                 download_type: str, download_audio: bool = False):
+    def __init__(self, session_info: dict, course_name: str, professor: str,
+                 download_type: str, download_audio: bool = False, output_dir: str = "output"):
         self.session_info = session_info
         self.course_name = course_name
         self.professor = professor
         self.download_type = download_type  # 'video' or 'screen'
         self.download_audio = download_audio
+        self.output_dir = output_dir  # 输出目录
         self.title = session_info['title']
         self.name = f"{course_name}-{professor}-{self.title}"
         
@@ -93,6 +94,7 @@ class LoginFrame(ctk.CTkFrame):
     def __init__(self, master, on_login_success: Callable):
         super().__init__(master)
         self.on_login_success = on_login_success
+        self.output_directory = "output"  # 默认输出目录
         
         # 标题
         self.configure(fg_color=G_BG)
@@ -128,43 +130,98 @@ class LoginFrame(ctk.CTkFrame):
             font=ctk.CTkFont(size=14)
         )
         self.course_entry.pack(fill="x", pady=(0, 10))
-        
+
+        # 输出目录选择
+        self.output_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
+        self.output_frame.pack(fill="x", padx=40, pady=10)
+
+        self.output_label = ctk.CTkLabel(
+            self.output_frame, text="保存目录:",
+            font=ctk.CTkFont(size=14), text_color=G_TEXT
+        )
+        self.output_label.pack(anchor="w", pady=(10, 5))
+
+        # 目录选择容器
+        dir_container = ctk.CTkFrame(self.output_frame, fg_color="transparent")
+        dir_container.pack(fill="x")
+
+        self.output_entry = ctk.CTkEntry(
+            dir_container,
+            placeholder_text="默认保存到 output/ 目录",
+            height=40,
+            font=ctk.CTkFont(size=14)
+        )
+        self.output_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        self.browse_btn = ctk.CTkButton(
+            dir_container,
+            text="浏览...",
+            width=80,
+            height=40,
+            command=self.browse_output_dir
+        )
+        self.browse_btn.pack(side="right")
+
         # Token输入
         self.token_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
         self.token_frame.pack(fill="x", padx=40, pady=10)
         
         self.token_label = ctk.CTkLabel(
-            self.token_frame, text="身份认证码 (可选):", 
+            self.token_frame, text="身份认证码 (必填):",
             font=ctk.CTkFont(size=14), text_color=G_TEXT
         )
         self.token_label.pack(anchor="w", pady=(10, 5))
         
         self.token_entry = ctk.CTkEntry(
-            self.token_frame, 
-            placeholder_text="若已登录可留空，首次使用需填写",
+            self.token_frame,
+            placeholder_text="请输入Token（按F12获取后复制）",
             height=40,
             font=ctk.CTkFont(size=14)
         )
         self.token_entry.pack(fill="x", pady=(0, 5))
-        
-        # 获取Token说明
-        help_text = (
-            "获取Token步骤：\n"
-            "1. 在浏览器打开 https://www.yanhekt.cn 并登录\n"
-            "2. 按 F12 打开开发者工具，切换到「控制台(Console)」标签\n"
-            "3. 在控制台输入以下代码并按回车：\n"
-            "   javascript:alert(JSON.parse(localStorage.auth).token)\n"
-            "   或者直接输入：JSON.parse(localStorage.auth).token\n"
-            "4. 复制弹出的认证码（32位字符）粘贴到下方输入框"
+
+        # Token获取代码和复制按钮
+        code_frame = ctk.CTkFrame(self.token_frame, fg_color="#0d1117")
+        code_frame.pack(fill="x", pady=(5, 10))
+
+        # 代码显示
+        self.code_label = ctk.CTkLabel(
+            code_frame,
+            text="javascript:alert(JSON.parse(localStorage.auth).token)",
+            font=ctk.CTkFont(size=11, family="Consolas"),
+            text_color="#58a6ff",
+            anchor="w"
         )
-        self.help_label = ctk.CTkLabel(
+        self.code_label.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+
+        # 复制按钮
+        self.copy_btn = ctk.CTkButton(
+            code_frame,
+            text="复制代码",
+            width=70,
+            height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color="#238636",
+            hover_color="#2ea043",
+            command=self.copy_token_code
+        )
+        self.copy_btn.pack(side="right", padx=5, pady=5)
+
+        # 获取方法说明
+        method_text = (
+            "获取Token方法：\n"
+            "方法1：在延河课堂网页地址栏输入（浏览器会自动去掉javascript:前缀，需手动补上）\n"
+            "方法2：按F12打开控制台，粘贴运行（推荐）"
+        )
+        self.method_label = ctk.CTkLabel(
             self.token_frame,
-            text=help_text,
-            font=ctk.CTkFont(size=10),
+            text=method_text,
+            font=ctk.CTkFont(size=9),
             text_color="#8b949e",
+            anchor="w",
             justify="left"
         )
-        self.help_label.pack(anchor="w", pady=(0, 10))
+        self.method_label.pack(anchor="w", pady=(0, 10))
         
         # 加载已保存的token
         saved_auth = utils.read_auth()
@@ -194,8 +251,11 @@ class LoginFrame(ctk.CTkFrame):
     def fetch_course(self):
         course_id = self.course_entry.get().strip()
         token = self.token_entry.get().strip()
-        
-        logger.info(f"开始获取课程: course_id={course_id}, token长度={len(token) if token else 0}")
+        output_dir = self.output_entry.get().strip()
+
+        # 保存输出目录（如果为空则使用默认output）
+        self.output_directory = output_dir if output_dir else "output"
+        logger.info(f"开始获取课程: course_id={course_id}, token长度={len(token) if token else 0}, 输出目录={self.output_directory}")
         
         if not course_id:
             logger.warning("课程ID为空")
@@ -224,9 +284,9 @@ class LoginFrame(ctk.CTkFrame):
                         "需要身份认证码",
                         "请先在浏览器登录延河课堂，然后获取Token：\n\n"
                         "1. 打开 https://www.yanhekt.cn 并登录\n"
-                        "2. 按F12打开控制台，输入以下代码：\n"
-                        "   javascript:alert(JSON.parse(localStorage.auth).token)\n"
-                        "3. 复制弹出的认证码（32位字符）粘贴到下方输入框"
+                        "2. 按F12打开控制台，粘贴运行：JSON.parse(localStorage.auth).token\n"
+                        "3. 复制弹出的认证码（32位字符）粘贴到下方输入框\n\n"
+                        "提示：可以点击界面上的「复制」按钮直接复制代码"
                     ))
                     self.after(0, lambda: self.fetch_btn.configure(state="normal"))
                     return
@@ -278,7 +338,7 @@ class LoginFrame(ctk.CTkFrame):
                         ))
                     self.after(0, lambda: self.fetch_btn.configure(state="normal"))
                     return
-                
+
                 if not auth_result:
                     if token:
                         self.after(0, lambda: self.show_error(
@@ -286,9 +346,9 @@ class LoginFrame(ctk.CTkFrame):
                             "Token无效或已过期。\n\n"
                             "请重新获取：\n"
                             "1. 打开 https://www.yanhekt.cn 并登录\n"
-                            "2. 按F12打开控制台，输入：\n"
-                            "   javascript:alert(JSON.parse(localStorage.auth).token)\n"
-                            "3. 复制新的认证码（32位字符）"
+                            "2. 按F12打开控制台，粘贴运行：JSON.parse(localStorage.auth).token\n"
+                            "3. 复制新的认证码（32位字符）\n\n"
+                            "提示：可以点击界面上的「复制」按钮直接复制代码"
                         ))
                     else:
                         self.after(0, lambda: self.show_error(
@@ -353,6 +413,29 @@ class LoginFrame(ctk.CTkFrame):
         thread.start()
         logger.info(f"do_fetch 线程已启动: {thread.name}")
     
+    def browse_output_dir(self):
+        """选择输出目录"""
+        from tkinter import filedialog
+        directory = filedialog.askdirectory(
+            title="选择保存目录",
+            initialdir=os.getcwd()
+        )
+        if directory:
+            self.output_entry.delete(0, "end")
+            self.output_entry.insert(0, directory)
+
+    def copy_token_code(self):
+        """复制Token获取代码到剪贴板"""
+        code = "javascript:alert(JSON.parse(localStorage.auth).token)"
+        self.clipboard_clear()
+        self.clipboard_append(code)
+        self.update()  # 保持剪贴板内容
+        # 显示复制成功提示
+        self.copy_btn.configure(text="已复制!", fg_color="#3fb950", hover_color="#3fb950")
+        self.after(2000, lambda: self.copy_btn.configure(
+            text="复制代码", fg_color="#238636", hover_color="#2ea043"
+        ))
+
     def show_error(self, title: str, message: str):
         """显示详细错误信息"""
         self.status_label.configure(text=f"❌ {title}", text_color=G_ERROR)
@@ -361,10 +444,11 @@ class LoginFrame(ctk.CTkFrame):
 
 class CourseSelectFrame(ctk.CTkFrame):
     """课程选择框架"""
-    def __init__(self, master, course_id: str, video_list: list, 
-                 course_name: str, professor: str, on_start_download: Callable, on_back: Callable):
+    def __init__(self, master, course_id: str, video_list: list,
+                 course_name: str, professor: str, output_dir: str, on_start_download: Callable, on_back: Callable):
         logger.info(f"CourseSelectFrame.__init__ 开始: {course_name}, {len(video_list)}个视频")
         super().__init__(master)
+        self.output_dir = output_dir  # 保存输出目录
         self.course_id = course_id
         self.video_list = video_list
         self.course_name = course_name
@@ -522,7 +606,7 @@ class CourseSelectFrame(ctk.CTkFrame):
         if not self.selected_indices:
             messagebox.showwarning("提示", "请至少选择一个视频")
             return
-        
+
         # 创建下载任务
         tasks = []
         for idx in sorted(self.selected_indices):
@@ -531,12 +615,13 @@ class CourseSelectFrame(ctk.CTkFrame):
                 course_name=self.course_name,
                 professor=self.professor,
                 download_type=self.download_type.get(),
-                download_audio=self.audio_var.get()
+                download_audio=self.audio_var.get(),
+                output_dir=self.output_dir  # 使用自定义输出目录
             )
             # 设置并发上限（默认 32，可在选择页调整）
             task.max_workers = self.workers_var.get()
             tasks.append(task)
-        
+
         self.on_start_download(tasks)
 
 
@@ -732,13 +817,13 @@ class DownloadFrame(ctk.CTkFrame):
                     video_info = videos[0]
                     if task.download_type == 'screen':
                         url = video_info.get('vga', '')
-                        path = f"output/{task.course_name}-screen"
+                        path = f"{task.output_dir}/{task.course_name}-screen"
                         if not url:
                             # 尝试备用字段
                             url = video_info.get('screen', '') or video_info.get('desktop', '')
                     else:
                         url = video_info.get('main', '')
-                        path = f"output/{task.course_name}-video"
+                        path = f"{task.output_dir}/{task.course_name}-video"
                         if not url:
                             # 尝试备用字段
                             url = video_info.get('camera', '') or video_info.get('video', '')
@@ -829,12 +914,12 @@ class DownloadFrame(ctk.CTkFrame):
                     video_info = videos[0]
                     if task.download_type == 'screen':
                         url = video_info.get('vga', '')
-                        path = f"output/{task.course_name}-screen"
+                        path = f"{task.output_dir}/{task.course_name}-screen"
                         if not url:
                             url = video_info.get('screen', '') or video_info.get('desktop', '')
                     else:
                         url = video_info.get('main', '')
-                        path = f"output/{task.course_name}-video"
+                        path = f"{task.output_dir}/{task.course_name}-video"
                         if not url:
                             url = video_info.get('camera', '') or video_info.get('video', '')
                     if not url:
@@ -916,7 +1001,8 @@ class YanheDownloaderApp(ctk.CTk):
         logger.info("登录界面已显示")
     
     def show_course_select(self, course_id, video_list, course_name, professor):
-        logger.info(f"显示课程选择界面: {course_name}, {len(video_list)}个视频")
+        output_dir = getattr(self, 'output_directory', 'output')
+        logger.info(f"显示课程选择界面: {course_name}, {len(video_list)}个视频, 输出目录={output_dir}")
         try:
             self.clear_container()
             logger.info("容器已清空，创建 CourseSelectFrame...")
@@ -926,6 +1012,7 @@ class YanheDownloaderApp(ctk.CTk):
                 video_list=video_list,
                 course_name=course_name,
                 professor=professor,
+                output_dir=output_dir,
                 on_start_download=self.show_download,
                 on_back=self.show_login
             )
