@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__web-search-prime__webSearchPrime",
+      "mcp__zread__read_file",
+      "mcp__web-reader__webReader",
+      "Bash(tree:*)",
+      "Bash(start \"\" \"dist/延河课堂下载器.exe\")",
+      "Bash(git remote set-url:*)",
+      "Bash(git push:*)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\97290\\\\Desktop\" -Filter *.mp4 -Recurse -ErrorAction SilentlyContinue)",
+      "Bash(Select-Object -First 3 FullName)",
+      "Bash(timeout:*)"
+    ]
+  }
+}
