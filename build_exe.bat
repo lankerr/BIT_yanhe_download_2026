@@ -35,7 +35,7 @@ python -m PyInstaller ^
     --windowed ^
     --noconfirm ^
     --clean ^
-    --add-data="gui_app.py;." ^
+    --icon=yhkt.ico ^
     --hidden-import=customtkinter ^
     --hidden-import=PIL ^
     --hidden-import=_tkinter ^
