@@ -3,19 +3,19 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 输出目录
-output/*
-!output/*.md
-!output/**/*.md
-
 # 临时文件
 old/
 *.zip
 *.log
+nul
+output.txt
+
+# 输出目录
+output/
+dist/output/
 
 # 打包相关
 build/
-dist/
 *.spec
 
 # 模型文件
@@ -24,18 +24,43 @@ whisper_models/
 # IDE
 .idea
 .DS_Store
-*.json
+
+# 敏感信息
 auth.txt
 
-# ================================
-# 以下功能开发中，暂不上传
-# ================================
-# 课件提取
-keyframes_to_pdf.py
-# 音频转录
-transcribe_cuda.py
-transcribe_maas.py
-local_transcribe_batch.py
 # FFmpeg
 ffmpeg.exe
 ffprobe.exe
+
+# ================================
+# 测试/实验文件（不上传）
+# ================================
+test_*.py
+*_test.py
+example_usage.py
+create_release*.py
+
+# 测试输出目录
+test_comparison*/
+output_test/
+output_ppt_test/
+github_extract/
+
+# 实验性脚本
+courseware_extractor.py
+ultimate_ppt_extractor.py
+pyscenedetect_hash_test.py
+gen_caption.py
+
+# 冗余文档
+README_原版.md
+README_CoursewareExtractor.md
+项目详解.md
+
+# 第三方库目录（应通过pip安装）
+PySceneDetect/
+vid2slides/
+video2pdf/
+extract-video-ppt/
+fast_scene_detection/
+sar_pyscenedetect/
