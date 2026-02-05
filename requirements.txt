@@ -2,3 +2,8 @@ requests
 windows-curses
 Flask
 customtkinter
+opencv-python
+imagehash
+Pillow
+tqdm
+python-pptx

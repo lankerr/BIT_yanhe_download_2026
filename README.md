@@ -50,6 +50,7 @@
 *   **现代化 GUI**: 基于 `CustomTkinter` 构建的“极客黑”主题界面，支持高分屏缩放与实时进度回显。
 *   **多信号源支持**: 支持下载**教师机屏幕**或**教室摄像头**两种画面信号。
 *   **音频提取**: [2026新增] 支持独立下载并保存教师的蓝牙麦克风音频轨道。
+*   **PPT智能提取**: [2026新增] 基于FFmpeg场景检测+感知哈希去重，从课程录像中自动提取PPT幻灯片，支持导出为PPTX格式。
 *   **极致便携**: 通过 PyInstaller 打包，内置 Python 运行时与 FFmpeg，无任何外部依赖。
 
 ---
@@ -98,7 +99,37 @@ python gui_app.py
 
 ---
 
-## 6. 更新日志
+## 6. PPT智能提取 (2026新功能)
+
+从课程录像中自动提取PPT幻灯片，基于FFmpeg场景检测技术，处理速度约为50倍实时（149分钟视频仅需约3分钟）。
+
+### 使用方法
+```bash
+# 基本用法：提取幻灯片到指定目录
+python ppt_extractor_gpu.py "视频路径.mp4" -o output/slides
+
+# 完整参数：提取并生成PPT文件
+python ppt_extractor_gpu.py "视频路径.mp4" -o output/slides -t 0.3 -p
+```
+
+### 参数说明
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `-o, --output` | 输出目录 | `output/ppt_slides` |
+| `-t, --threshold` | 场景检测阈值 (0.0-1.0，越小越敏感) | `0.1` |
+| `-m, --min-interval` | 最小场景间隔（秒） | `2.0` |
+| `-s, --similarity` | 相似度去重阈值 | `0.9` |
+| `-p, --pptx` | 同时生成PPTX文件 | 关闭 |
+
+### 技术原理
+1. **FFmpeg场景检测**: 使用 `select='gt(scene,threshold)'` 滤镜检测画面剧烈变化
+2. **时间戳过滤**: 过滤太接近的场景变化（避免老师快速翻页产生的冗余）
+3. **感知哈希去重**: 使用 pHash 算法识别并去除相似帧
+4. **PPTX生成**: 使用 python-pptx 将图片合并为16:9的PPT文件
+
+---
+
+## 7. 更新日志
 
 ### v1.2.0 (2026-02-06) - 尾部优化专项版
 
@@ -158,7 +189,7 @@ python gui_app.py
 
 ---
 
-## 7. 致谢与声明
+## 8. 致谢与声明
 
 本项目基于 [AuYang261/BIT_yanhe_download](https://github.com/AuYang261/BIT_yanhe_download) 开发。
 
