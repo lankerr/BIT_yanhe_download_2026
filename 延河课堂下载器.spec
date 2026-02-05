@@ -3,12 +3,15 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('yhkt.ico', '.')]
 binaries = []
-hiddenimports = ['customtkinter', 'PIL', '_tkinter', 'numpy']
+hiddenimports = [
+    'customtkinter', 'PIL', '_tkinter',
+    'requests', 'urllib3', 
+    'charset_normalizer', 'idna', 'certifi',
+    'tkinter', 'tkinter.ttk', 'tkinter.messagebox', 'tkinter.filedialog',
+    'queue', 'threading', 'concurrent.futures',
+]
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-
-
-block_cipher = None
 
 
 a = Analysis(
@@ -20,19 +23,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['numpy.core.multiarray'],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
+    excludes=[],
     noarchive=False,
+    optimize=0,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
     name='延河课堂下载器',
@@ -48,5 +48,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='yhkt.ico',
+    icon=['yhkt.ico'],
 )

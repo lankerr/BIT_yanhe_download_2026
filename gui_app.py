@@ -26,18 +26,35 @@ def get_resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+
+def get_app_dir():
+    """获取应用程序所在目录（用于存储配置文件等）"""
+    if getattr(sys, 'frozen', False):
+        # 打包后的 exe，使用 exe 所在目录
+        return os.path.dirname(sys.executable)
+    else:
+        # 开发环境，使用当前脚本目录
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+# 设置工作目录为应用程序目录（确保相对路径正确）
+app_dir = get_app_dir()
+os.chdir(app_dir)
+log_file_path = os.path.join(app_dir, 'gui_debug.log')
+
 # 配置日志 - 同时输出到控制台和文件
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler('gui_debug.log', encoding='utf-8', mode='w'),
+        logging.FileHandler(log_file_path, encoding='utf-8', mode='w'),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 logger.info("=" * 50)
-logger.info("GUI 启动中...")
+logger.info(f"GUI 启动中... 应用目录: {app_dir}")
+logger.info(f"日志文件: {log_file_path}")
 
 # 导入项目模块
 try:
@@ -96,7 +113,7 @@ class DownloadTask:
         self.error_msg = ""
         self.current_threads = 0
         self.max_threads = 0
-        self.max_workers = 32  # 默认并发上限（可由 GUI 调整）
+        self.max_workers = 64  # 默认并发上限，与CLI保持一致
 
 
 class LoginFrame(ctk.CTkFrame):
@@ -527,7 +544,7 @@ class CourseSelectFrame(ctk.CTkFrame):
         )
         self.workers_label.grid(row=1, column=0, padx=10, pady=10, sticky="w")
 
-        self.workers_var = tk.IntVar(value=32)
+        self.workers_var = tk.IntVar(value=64)  # 与CLI保持一致
         self.workers_value = ctk.CTkLabel(
             self.options_frame, text="32",
             font=ctk.CTkFont(size=12), text_color="#8b949e"
@@ -646,6 +663,10 @@ class DownloadFrame(ctk.CTkFrame):
         self.is_downloading = True
         self.current_task_idx = 0
         
+        # 创建进度消息队列（线程安全）
+        self.progress_queue = queue.Queue()
+        self.poll_interval = 50  # 50ms 轮询一次
+        
         # 标题
         self.configure(fg_color=G_BG)
         self.header = ctk.CTkFrame(self, fg_color=G_PANEL)
@@ -716,6 +737,9 @@ class DownloadFrame(ctk.CTkFrame):
         self.log_text.configure(font=("Consolas", 11))
         self.log_text.pack(fill="x", pady=5)
         
+        # 启动进度队列轮询
+        self.poll_progress_queue()
+        
         # 开始下载
         self.start_downloads()
     
@@ -784,7 +808,8 @@ class DownloadFrame(ctk.CTkFrame):
             status_text = "正在获取视频信息..."
             status_color = G_ACCENT
         elif status == 0:  # 下载中
-            status_text = f"下载中: {downloaded}/{total}"
+            percent = int(100 * downloaded / total) if total > 0 else 0
+            status_text = f"下载中: {downloaded}/{total} ({percent}%)"
             status_color = G_WARN
         elif status == 1:  # 合并中
             status_text = "合并视频中..."
@@ -799,9 +824,37 @@ class DownloadFrame(ctk.CTkFrame):
         
         widgets['status_label'].configure(text=status_text, text_color=status_color)
         
-        # 更新线程信息
-        if threads > 0:
+        # 更新线程信息 - 总是显示
+        if max_threads > 0:
             widgets['thread_label'].configure(text=f"线程: {threads}/{max_threads}")
+    
+    def poll_progress_queue(self):
+        """轮询进度队列，从后台线程获取更新并安全地更新GUI"""
+        try:
+            # 一次处理最多20条消息，避免阻塞
+            for _ in range(20):
+                try:
+                    msg = self.progress_queue.get_nowait()
+                except queue.Empty:
+                    break
+                
+                msg_type = msg.get('type')
+                if msg_type == 'progress':
+                    self.update_task_progress(
+                        msg['idx'], msg['downloaded'], msg['total'],
+                        msg['status'], msg['threads'], msg['max_threads']
+                    )
+                elif msg_type == 'log':
+                    self.log(msg['message'])
+                elif msg_type == 'overall':
+                    self.overall_label.configure(text=msg['text'])
+                    self.overall_progress.set(msg['value'])
+        except Exception as e:
+            logger.error(f"poll_progress_queue 错误: {e}")
+        
+        # 继续轮询（如果还在下载）
+        if self.is_downloading:
+            self.after(self.poll_interval, self.poll_progress_queue)
     
     def log(self, message: str):
         """添加日志"""
@@ -819,15 +872,19 @@ class DownloadFrame(ctk.CTkFrame):
                 
                 self.current_task_idx = idx
                 self.after(0, lambda i=idx: self.update_task_progress(i, 0, 0, 0))
-                self.after(0, lambda t=task: self.log(f"开始下载: {t.name}"))
+                self.after(0, lambda t=task: self.log(f"▶ 开始下载: {t.name}"))
+                logger.info(f"开始下载任务 {idx+1}/{len(self.tasks)}: {task.name}")
                 
                 try:
                     # 获取视频URL
                     videos = task.session_info.get('videos', [])
+                    logger.debug(f"视频信息: {videos}")
                     if not videos:
-                        raise Exception("该课程没有视频信息")
+                        raise Exception("该课程没有视频信息，请确认课程有录像")
                     
                     video_info = videos[0]
+                    logger.debug(f"video_info keys: {list(video_info.keys())}")
+                    
                     if task.download_type == 'screen':
                         url = video_info.get('vga', '')
                         path = f"{task.output_dir}/{task.course_name}-screen"
@@ -841,21 +898,55 @@ class DownloadFrame(ctk.CTkFrame):
                             # 尝试备用字段
                             url = video_info.get('camera', '') or video_info.get('video', '')
                     
+                    logger.info(f"视频URL: {url[:80] if url else '(空)'}...")
+                    logger.info(f"保存路径: {path}")
+                    
                     if not url:
                         # 打印可用的字段供调试
                         available_keys = list(video_info.keys())
-                        self.after(0, lambda keys=available_keys: self.log(f"可用字段: {keys}"))
-                        raise Exception(f"未找到视频URL (类型: {task.download_type})")
+                        self.after(0, lambda keys=available_keys: self.log(f"⚠ 可用字段: {keys}"))
+                        raise Exception(f"未找到视频URL (类型: {task.download_type})，视频可能未生成")
                     
-                    # 创建输出目录
-                    os.makedirs(path, exist_ok=True)
+                    # 创建输出目录 (使用绝对路径)
+                    full_path = os.path.join(utils.get_app_path(), path)
+                    os.makedirs(full_path, exist_ok=True)
+                    logger.info(f"创建输出目录: {full_path}")
                     
-                    # 进度回调 - 使用闭包捕获正确的 idx
+                    # 用于日志节流的变量
+                    last_log_downloaded = [0]  # 使用列表以便在闭包中修改
+                    
+                    # 进度回调 - 使用队列进行线程安全通信
                     current_idx = idx
-                    def progress_callback(downloaded, total, status, threads=0, max_threads=0, idx=current_idx):
-                        self.after(0, lambda: self.update_task_progress(
-                            idx, downloaded, total, status, threads, max_threads
-                        ))
+                    task_name = task.name
+                    progress_queue = self.progress_queue  # 捕获队列引用
+                    
+                    def progress_callback(downloaded, total, status, threads=0, max_threads=0, 
+                                         idx=current_idx, name=task_name, q=progress_queue):
+                        # 发送进度更新到队列
+                        q.put({
+                            'type': 'progress',
+                            'idx': idx,
+                            'downloaded': downloaded,
+                            'total': total,
+                            'status': status,
+                            'threads': threads,
+                            'max_threads': max_threads
+                        })
+                        
+                        # 在日志中显示进度（每5%输出一次）
+                        if total > 0 and status == 0:
+                            step = max(1, total // 20)  # 5% 步进
+                            if downloaded >= last_log_downloaded[0] + step or downloaded == total:
+                                last_log_downloaded[0] = downloaded
+                                percent = int(100 * downloaded / total)
+                                q.put({
+                                    'type': 'log',
+                                    'message': f"📥 {name[:25]}... {downloaded}/{total} ({percent}%) 🧵{threads}/{max_threads}"
+                                })
+                        elif status == 1:
+                            q.put({'type': 'log', 'message': f"🔄 正在合并: {name[:35]}..."})
+                        elif status == 2:
+                            q.put({'type': 'log', 'message': f"✅ 完成: {name}"})
                     
                     # 开始下载
                     m3u8dl.M3u8Download(
@@ -885,12 +976,21 @@ class DownloadFrame(ctk.CTkFrame):
                     ))
                     
                 except Exception as e:
+                    import traceback
+                    error_full = str(e)
+                    error_traceback = traceback.format_exc()
                     task.status = "失败"
-                    task.error_msg = str(e)[:30]
+                    task.error_msg = error_full[:50]
+                    
+                    # 在日志中输出完整错误信息
+                    logger.error(f"下载失败: {task.name}")
+                    logger.error(f"错误详情: {error_full}")
+                    logger.error(f"堆栈跟踪:\n{error_traceback}")
+                    
                     self.after(0, lambda i=idx, t=task: self.update_task_progress(
                         i, 0, 0, -1
                     ))
-                    self.after(0, lambda t=task, e=e: self.log(f"失败: {t.name} - {e}"))
+                    self.after(0, lambda t=task, e=error_full: self.log(f"❌ 失败: {t.name}\n   原因: {e[:100]}"))
             
             # 完成
             if self.is_downloading:
@@ -940,11 +1040,41 @@ class DownloadFrame(ctk.CTkFrame):
                         self.after(0, lambda keys=available_keys: self.log(f"可用字段: {keys}"))
                         raise Exception(f"未找到视频URL (类型: {task.download_type})")
                     os.makedirs(path, exist_ok=True)
+                    
+                    # 用于日志节流的变量
+                    last_log_downloaded = [0]
+                    
                     current_idx = idx
-                    def progress_callback(downloaded, total, status, threads=0, max_threads=0, idx=current_idx):
-                        self.after(0, lambda: self.update_task_progress(
-                            idx, downloaded, total, status, threads, max_threads
-                        ))
+                    task_name = task.name
+                    progress_queue = self.progress_queue  # 捕获队列引用
+                    
+                    def progress_callback(downloaded, total, status, threads=0, max_threads=0, 
+                                         idx=current_idx, name=task_name, q=progress_queue):
+                        # 发送进度更新到队列
+                        q.put({
+                            'type': 'progress',
+                            'idx': idx,
+                            'downloaded': downloaded,
+                            'total': total,
+                            'status': status,
+                            'threads': threads,
+                            'max_threads': max_threads
+                        })
+                        
+                        # 在日志中显示进度（每5%输出一次）
+                        if total > 0 and status == 0:
+                            step = max(1, total // 20)  # 5% 步进
+                            if downloaded >= last_log_downloaded[0] + step or downloaded == total:
+                                last_log_downloaded[0] = downloaded
+                                percent = int(100 * downloaded / total)
+                                q.put({
+                                    'type': 'log',
+                                    'message': f"📥 {name[:25]}... {downloaded}/{total} ({percent}%) 🧵{threads}/{max_threads}"
+                                })
+                        elif status == 1:
+                            q.put({'type': 'log', 'message': f"🔄 正在合并: {name[:35]}..."})
+                        elif status == 2:
+                            q.put({'type': 'log', 'message': f"✅ 完成: {name}"})
                     m3u8dl.M3u8Download(
                         url=url,
                         workDir=path,

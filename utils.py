@@ -1,8 +1,25 @@
 import os
+import sys
 import time
 from hashlib import md5
 
 import requests
+
+
+def get_app_path():
+    """获取应用程序所在目录（支持打包后的 exe）"""
+    if getattr(sys, 'frozen', False):
+        # 打包后的 exe，使用 exe 所在目录
+        return os.path.dirname(sys.executable)
+    else:
+        # 开发环境，使用当前脚本目录
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_auth_file_path():
+    """获取 auth.txt 的完整路径"""
+    return os.path.join(get_app_path(), "auth.txt")
+
 
 # 在延河课堂网站的main.js中4937号的O[N(149, 270, 240, 274)]["k"]()函数的返回值
 magic = "1138b69dfef641d9d7ba49137d2d4875"
@@ -75,24 +92,27 @@ def add_signature_for_url(url: str, token: str, timestamp: str, signature: str) 
 
 
 def read_auth():
-    if not os.path.exists("auth.txt"):
+    auth_path = get_auth_file_path()
+    if not os.path.exists(auth_path):
         return ""
-    with open("auth.txt") as f:
+    with open(auth_path, encoding="utf-8") as f:
         auth = f.read().strip()
         headers["Authorization"] = "Bearer " + auth
     return auth
 
 
 def write_auth(auth):
+    auth_path = get_auth_file_path()
     headers["Authorization"] = "Bearer " + auth
-    with open("auth.txt", "w") as f:
+    with open(auth_path, "w", encoding="utf-8") as f:
         f.write(auth)
 
 
 def remove_auth():
+    auth_path = get_auth_file_path()
     headers["Authorization"] = ""
-    if os.path.exists("auth.txt"):
-        os.remove("auth.txt")
+    if os.path.exists(auth_path):
+        os.remove(auth_path)
 
 
 def test_auth(courseID):
