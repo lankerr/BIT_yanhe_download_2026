@@ -1,9 +1,19 @@
+# ---- 下载 / GUI（简易版必需）----
 requests
-windows-curses
-Flask
 customtkinter
+Pillow
+pycryptodome
+
+# ---- 后处理（完整版必需）----
 opencv-python
 imagehash
-Pillow
 tqdm
 python-pptx
+faster-whisper
+
+# ---- 打包 ----
+pyinstaller
+
+# ---- GPU 可选（手动安装，pip 不会自动拉，体积大）----
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.x + cuDNN 9 需要手动从 NVIDIA 官网安装

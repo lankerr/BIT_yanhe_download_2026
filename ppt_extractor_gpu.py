@@ -16,6 +16,12 @@ from tqdm import tqdm
 import imagehash
 from PIL import Image
 
+try:
+    from app_paths import ffmpeg_path, ffprobe_path
+except ImportError:
+    def ffmpeg_path(): return "ffmpeg"
+    def ffprobe_path(): return "ffprobe"
+
 # 尝试导入pptx
 try:
     from pptx import Presentation
@@ -33,7 +39,7 @@ JPG_QUALITY = 95  # JPEG质量
 def get_video_duration(video_path: str) -> float:
     """获取视频时长（秒）"""
     cmd = [
-        'ffprobe', '-v', 'error',
+        ffprobe_path(), '-v', 'error',
         '-show_entries', 'format=duration',
         '-of', 'csv=p=0',
         video_path
@@ -54,7 +60,7 @@ def detect_scenes_ffmpeg(video_path: str, threshold: float = SCENE_THRESHOLD) ->
     duration_str = f"{int(duration//60)}分{int(duration%60)}秒" if duration > 0 else "未知"
     
     cmd = [
-        'ffmpeg', '-hide_banner',
+        ffmpeg_path(), '-hide_banner',
         '-i', video_path,
         '-vf', f"select='gt(scene,{threshold})',showinfo",
         '-an', '-f', 'null', '-'
@@ -125,7 +131,7 @@ def filter_close_timestamps(timestamps: List[float], min_interval: float = MIN_S
 def extract_frame_at_time(video_path: str, timestamp: float) -> Optional[np.ndarray]:
     """使用FFmpeg在指定时间点提取单帧"""
     cmd = [
-        'ffmpeg', '-hide_banner', '-loglevel', 'error',
+        ffmpeg_path(), '-hide_banner', '-loglevel', 'error',
         '-ss', str(timestamp),
         '-i', video_path,
         '-vframes', '1',
@@ -134,15 +140,15 @@ def extract_frame_at_time(video_path: str, timestamp: float) -> Optional[np.ndar
         '-vcodec', 'rawvideo',
         '-'
     ]
-    
+
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=10)
         if result.returncode != 0:
             return None
-        
+
         # 获取视频尺寸
         probe_cmd = [
-            'ffprobe', '-v', 'error',
+            ffprobe_path(), '-v', 'error',
             '-select_streams', 'v:0',
             '-show_entries', 'stream=width,height',
             '-of', 'csv=p=0',

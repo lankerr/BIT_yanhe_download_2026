@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import queue
 import re
@@ -13,6 +14,20 @@ import urllib3
 
 import utils
 import threading
+
+# ====== Module-level file logger ======
+logger = logging.getLogger("m3u8dl")
+if not logger.handlers:
+    _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download.log")
+    _fh = logging.FileHandler(_log_path, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_fh)
+    # Also log to console for real-time visibility
+    _ch = logging.StreamHandler()
+    _ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    _ch.setLevel(logging.WARNING)  # Console only shows warnings+
+    logger.addHandler(_ch)
+    logger.setLevel(logging.DEBUG)
 
 
 class ThreadPoolExecutorWithQueueSizeLimit(ThreadPoolExecutor):
@@ -111,7 +126,9 @@ class M3u8Download:
         # self._current_max_workers initialized in __init__
         self._active_threads = 0
         self._thread_cond = threading.Condition()
-        self._min_workers = 1
+        self._min_workers = 4  # Floor of 4 to prevent death spiral
+        self._total_timeout = 120  # 2 min wall-clock limit per .ts file
+        self._consecutive_failures = 0  # Track consecutive failures for backoff
         self._headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/93.0.4577.82 Safari/537.36 Edg/93.0.961.52",
             "Origin": "https://www.yanhekt.cn",
@@ -155,7 +172,7 @@ class M3u8Download:
         print(f"Downloading: {self._name}", f"Save path: {self._file_path}", sep="\n")
         
         # 提交所有任务到线程池
-        pool = ThreadPoolExecutorWithQueueSizeLimit(self._max_workers * 2)
+        pool = ThreadPoolExecutorWithQueueSizeLimit(self._max_workers)
         pool.submit(self.updateSignatureLoop)
         for k, ts_url in enumerate(self._ts_url_list):
             pool.submit(
@@ -173,6 +190,21 @@ class M3u8Download:
         while self._success_sum < self._ts_sum:
             time.sleep(2)  # 每2秒检查一次
             
+            # Watchdog 触发时立即退出主循环进入尾部补下载
+            if self._watchdog_triggered:
+                print(f"\n[主循环退出] Watchdog triggered, 进入尾部补下载流程")
+                # 重置 watchdog 标志以便尾部模式可以继续
+                self._watchdog_triggered = False
+                self._last_activity_time = time.time()
+                self._downloading = True
+                # 重启 watchdog 线程
+                self._watchdog_thread = threading.Thread(target=self.watchdog, daemon=True)
+                self._watchdog_thread.start()
+                with self._thread_cond:
+                    self._current_max_workers = 9999
+                    self._thread_cond.notify_all()
+                break
+            
             current_progress = self._success_sum
             remaining = self._ts_sum - current_progress
             
@@ -184,8 +216,8 @@ class M3u8Download:
                 # 无进度，检查是否超时
                 stall_duration = time.time() - last_progress_time
                 
-                # 如果剩余文件少且停滞超时，进入尾部模式
-                if remaining > 0 and remaining < 20 and stall_duration > stall_timeout:
+                # 停滞超时即进入尾部模式（不再限制剩余数量）
+                if remaining > 0 and stall_duration > stall_timeout:
                     print(f"\n[停滞检测] {stall_duration:.0f}秒无进度，剩余{remaining}个文件，强制进入尾部模式")
                     self._tail_mode = True
                     # 释放所有等待的线程
@@ -317,11 +349,24 @@ class M3u8Download:
     def watchdog(self):
         while self._downloading:
             time.sleep(5)
+            idle = time.time() - self._last_activity_time
+            # Periodic status logging every 30s
+            if idle > 30 and int(idle) % 30 < 6:
+                logger.info(
+                    f"Watchdog: {self._name} idle={idle:.0f}s "
+                    f"progress={self._success_sum}/{self._ts_sum} "
+                    f"threads={self._active_threads}/{self._current_max_workers}"
+                )
             # Use the adaptive timeout value
-            if time.time() - self._last_activity_time > self._watchdog_timeout:
+            if idle > self._watchdog_timeout:
+                logger.error(
+                    f"Watchdog TRIGGERED for {self._name}: "
+                    f"idle={idle:.0f}s > {self._watchdog_timeout}s, "
+                    f"progress={self._success_sum}/{self._ts_sum}, "
+                    f"threads={self._active_threads}/{self._current_max_workers}"
+                )
                 print(f"\n[Watchdog] Download hung for {self._watchdog_timeout}s!")
                 self._watchdog_triggered = True
-                # 不再强制退出，设置标记让主逻辑处理
                 self._downloading = False
                 return
 
@@ -370,12 +415,13 @@ class M3u8Download:
                     raise Exception(error_msg)
                 
                 self._front_url = res.url.split(res.request.path_url)[0]
-                content_preview = res.text[:200] if res.text else "(空响应)"
+                m3u8_text = res.content.decode("utf-8", errors="replace")
+                content_preview = m3u8_text[:200] if m3u8_text else "(空响应)"
                 print(f"[M3u8Download] m3u8 内容预览: {content_preview}")
                 
-                if "EXT-X-STREAM-INF" in res.text:  # 判定为顶级M3U8文件
+                if "EXT-X-STREAM-INF" in m3u8_text:  # 判定为顶级M3U8文件
                     print("[M3u8Download] 检测到顶级 m3u8，正在解析子文件...")
-                    for line in res.text.split("\n"):
+                    for line in m3u8_text.split("\n"):
                         if "#" in line:
                             continue
                         elif line.startswith("http"):
@@ -386,8 +432,7 @@ class M3u8Download:
                             self._url = self._url.rsplit("/", 1)[0] + "/" + line
                     self.get_m3u8_info(self._url, self._num_retries)
                 else:
-                    m3u8_text_str = res.text
-                    self.get_ts_url(m3u8_text_str)
+                    self.get_ts_url(m3u8_text)
                     print(f"[M3u8Download] 成功解析 {self._ts_sum} 个 ts 文件")
         except requests.exceptions.Timeout as e:
             print(f"[M3u8Download] 请求超时: {e}")
@@ -451,8 +496,16 @@ class M3u8Download:
             return
             
         with self._thread_cond:
+            wait_start = time.time()
             while self._active_threads >= self._current_max_workers:
-                self._thread_cond.wait()
+                # Timeout wait: prevent indefinite blocking
+                self._thread_cond.wait(timeout=10)
+                if time.time() - wait_start > 60:
+                    logger.warning(
+                        f"Slot wait timeout 60s, forcing through "
+                        f"(active={self._active_threads}, max={self._current_max_workers})"
+                    )
+                    break
             self._active_threads += 1
 
     def _release_slot(self, success=True):
@@ -466,11 +519,22 @@ class M3u8Download:
                 
             if success:
                 # Additive Increase
+                self._consecutive_failures = 0
                 if self._current_max_workers < self._max_workers:
                     self._current_max_workers += 1
             else:
-                # Multiplicative Decrease
-                self._current_max_workers = max(self._min_workers, self._current_max_workers // 2)
+                # Gentle Linear Decrease (NOT multiplicative halving!)
+                # This prevents the death spiral where 3 failures = 64->8
+                self._consecutive_failures += 1
+                self._current_max_workers = max(
+                    self._min_workers, self._current_max_workers - 2
+                )
+                # If many consecutive failures, add a small backoff delay
+                if self._consecutive_failures >= 5:
+                    logger.warning(
+                        f"{self._consecutive_failures} consecutive failures, "
+                        f"workers={self._current_max_workers}, adding 2s backoff"
+                    )
             self._thread_cond.notify_all()
 
     def download_ts(self, ts_url_original: str, name: str, num_retries: int) -> None:
@@ -501,10 +565,11 @@ class M3u8Download:
             
             if not os.path.exists(name):
                 try:
+                    _dl_start = time.time()
                     with requests.get(
                         ts_url,
                         stream=True,
-                        timeout=(5, 60),
+                        timeout=(5, 15),  # Reduced read timeout: 5s connect, 15s read
                         verify=False,
                         headers=self._headers,
                     ) as res:
@@ -520,6 +585,12 @@ class M3u8Download:
                                     if chunk:
                                         ts.write(chunk)
                                         total_bytes += len(chunk)
+                                    # Wall-clock total timeout check
+                                    if time.time() - _dl_start > self._total_timeout:
+                                        raise TimeoutError(
+                                            f"Total timeout {self._total_timeout}s exceeded "
+                                            f"for {os.path.basename(name)} ({total_bytes} bytes so far)"
+                                        )
                             
                             file_size = os.path.getsize(name)
                             # 放宽文件大小验证：只有完全空的文件才是问题
@@ -575,6 +646,8 @@ class M3u8Download:
         except Exception as e:
             # Failure case - 直接放入失败队列，不阻塞线程
             self._release_slot(success=False)
+            logger.info(f"FAIL {os.path.basename(name)}: {type(e).__name__}: {e} "
+                        f"(threads={self._active_threads}/{self._current_max_workers})")
             if os.path.exists(name):
                 try:
                     os.remove(name)
@@ -625,7 +698,7 @@ class M3u8Download:
                 with requests.get(
                     ts_url,
                     stream=True,
-                    timeout=(10, 90),  # 连接10秒，读取90秒
+                    timeout=(5, 15),  # Reduced read timeout
                     verify=False,
                     headers=self._headers,
                 ) as res:
@@ -634,10 +707,15 @@ class M3u8Download:
                         if not os.path.exists(dir_path):
                             os.makedirs(dir_path, exist_ok=True)
                         
+                        _dl_start = time.time()
                         with open(name, "wb") as ts:
                             for chunk in res.iter_content(chunk_size=8192):
                                 if chunk:
                                     ts.write(chunk)
+                                if time.time() - _dl_start > self._total_timeout:
+                                    raise TimeoutError(
+                                        f"Total timeout {self._total_timeout}s in simple download"
+                                    )
                         
                         if os.path.getsize(name) > 0:
                             self._success_sum += 1
@@ -698,10 +776,8 @@ class M3u8Download:
         """
         合并.ts文件，输出mp4格式视频，需要ffmpeg
         """
-        # Check for local ffmpeg
-        ffmpeg_cmd = "ffmpeg"
-        if os.path.exists("ffmpeg.exe"):
-            ffmpeg_cmd = os.path.abspath("ffmpeg.exe")
+        from app_paths import ffmpeg_path
+        ffmpeg_cmd = ffmpeg_path()
             
         cmd = [
             ffmpeg_cmd,

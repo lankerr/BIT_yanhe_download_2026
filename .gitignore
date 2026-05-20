@@ -9,36 +9,54 @@ old/
 *.log
 nul
 output.txt
+debug.log
+gui_debug.log
 
 # 输出目录
 output/
 dist/output/
+_temp_download/
 
 # 打包相关
 build/
+dist/
+# 自动生成的 spec 文件不入库；项目自带的两个 spec 显式追加白名单
 *.spec
+!延河课堂下载器-简易版.spec
+!延河课堂下载器-完整版.spec
 
 # 模型文件
 whisper_models/
+*.bin
+*.onnx
+*.safetensors
 
 # IDE
 .idea
 .DS_Store
+.vscode/
 
-# 敏感信息
+# 敏感信息 / 用户配置
 auth.txt
+**/auth.txt
+down_list.txt
+down_list_orig.txt
 
-# FFmpeg
+# 打包内嵌的 FFmpeg（每个开发者本机准备）
 ffmpeg.exe
 ffprobe.exe
 
-# ================================
-# 测试/实验文件（不上传）
-# ================================
+# 实验 / 临时（限根目录；legacy 目录内显式放行）
 test_*.py
 *_test.py
 example_usage.py
 create_release*.py
+/_*.py
+/_*.txt
+/_*.json
+/analysis_*.txt
+/batch_*.log
+!scripts/legacy/**
 
 # 测试输出目录
 test_comparison*/
@@ -46,18 +64,11 @@ output_test/
 output_ppt_test/
 github_extract/
 
-# 实验性脚本
-courseware_extractor.py
-ultimate_ppt_extractor.py
-pyscenedetect_hash_test.py
-gen_caption.py
+# 历史 legacy 脚本目录中的运行产物
+scripts/legacy/**/*.log
+scripts/legacy/**/_*.json
 
-# 冗余文档
-README_原版.md
-README_CoursewareExtractor.md
-项目详解.md
-
-# 第三方库目录（应通过pip安装）
+# 第三方库源码目录（应通过pip安装）
 PySceneDetect/
 vid2slides/
 video2pdf/

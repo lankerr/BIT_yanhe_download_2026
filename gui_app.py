@@ -2,6 +2,9 @@
 延河课堂下载器 - 现代化GUI界面
 基于 AuYang261/BIT_yanhe_download 改进
 新增：多线程自适应下载、Watchdog监控、关键帧提取等功能
+
+通过入口脚本注入 YHKT_EDITION=simple|full 切换简易版 / 完整版。
+简易版隐藏后处理工具入口，并按需懒加载 PPT/Whisper 模块。
 """
 
 import customtkinter as ctk
@@ -16,25 +19,20 @@ import logging
 import traceback
 from typing import Optional, List, Dict, Callable
 
+from app_paths import (
+    get_app_dir as _shared_get_app_dir,
+    resource_path as _shared_resource_path,
+    is_full_edition,
+    edition_label,
+)
+
 
 def get_resource_path(relative_path):
-    """获取资源文件的绝对路径，支持打包后的环境"""
-    try:
-        # PyInstaller 创建临时文件夹，将路径存储在 _MEIPASS
-        base_path = sys._MEIPASS
-    except AttributeError:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+    return _shared_resource_path(relative_path)
 
 
 def get_app_dir():
-    """获取应用程序所在目录（用于存储配置文件等）"""
-    if getattr(sys, 'frozen', False):
-        # 打包后的 exe，使用 exe 所在目录
-        return os.path.dirname(sys.executable)
-    else:
-        # 开发环境，使用当前脚本目录
-        return os.path.dirname(os.path.abspath(__file__))
+    return _shared_get_app_dir()
 
 
 # 设置工作目录为应用程序目录（确保相对路径正确）
@@ -118,9 +116,10 @@ class DownloadTask:
 
 class LoginFrame(ctk.CTkFrame):
     """登录框架"""
-    def __init__(self, master, on_login_success: Callable):
+    def __init__(self, master, on_login_success: Callable, on_post_process: Callable = None):
         super().__init__(master)
         self.on_login_success = on_login_success
+        self.on_post_process = on_post_process
         self.output_directory = "output"  # 默认输出目录
         
         # 标题
@@ -264,7 +263,19 @@ class LoginFrame(ctk.CTkFrame):
             hover_color="#3B83CE",
             command=self.fetch_course
         )
-        self.fetch_btn.pack(pady=30, padx=40, fill="x")
+        self.fetch_btn.pack(pady=(30, 10), padx=40, fill="x")
+
+        # 后处理工具按钮（仅完整版可用；简易版直接不显示，避免误触发未打包模块）
+        if is_full_edition():
+            self.postprocess_btn = ctk.CTkButton(
+                self, text="🔧 后处理工具 (课件提取 + 音频转录)",
+                height=40,
+                font=ctk.CTkFont(size=14),
+                fg_color="#238636",
+                hover_color="#2ea043",
+                command=self._open_post_process
+            )
+            self.postprocess_btn.pack(pady=(0, 10), padx=40, fill="x")
         
         # 状态标签
         self.status_label = ctk.CTkLabel(
@@ -467,6 +478,11 @@ class LoginFrame(ctk.CTkFrame):
         """显示详细错误信息"""
         self.status_label.configure(text=f"❌ {title}", text_color=G_ERROR)
         messagebox.showerror(title, message)
+
+    def _open_post_process(self):
+        """打开后处理工具"""
+        if self.on_post_process:
+            self.on_post_process()
 
 
 class CourseSelectFrame(ctk.CTkFrame):
@@ -1100,12 +1116,269 @@ class DownloadFrame(ctk.CTkFrame):
         self.on_complete()
 
 
+class PostProcessFrame(ctk.CTkFrame):
+    """后处理框架 - 课件提取 + 音频转录"""
+
+    def __init__(self, master, on_back: callable):
+        super().__init__(master)
+        self.on_back = on_back
+        self.is_processing = False
+        self.configure(fg_color=G_BG)
+
+        # 顶部标题栏
+        self.header = ctk.CTkFrame(self, fg_color=G_PANEL)
+        self.header.pack(fill="x", padx=20, pady=10)
+
+        self.back_btn = ctk.CTkButton(
+            self.header, text="← 返回", width=80, command=on_back
+        )
+        self.back_btn.pack(side="left")
+
+        self.title_label = ctk.CTkLabel(
+            self.header, text="🔧 后处理工具 - 课件提取 & 音频转录",
+            font=ctk.CTkFont(size=18, weight="bold"), text_color=G_TEXT,
+        )
+        self.title_label.pack(side="left", padx=20)
+
+        # GPU 检测提示横幅（在创建参数控件前先决定默认设备）
+        gpu_ok, gpu_msg = self._detect_gpu()
+        banner = ctk.CTkFrame(self, fg_color="#1f6feb" if gpu_ok else "#9e6a03")
+        banner.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(
+            banner,
+            text=gpu_msg,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#ffffff",
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=12, pady=8)
+        self._gpu_ok = gpu_ok
+
+        # 目录选择
+        dir_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
+        dir_frame.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(
+            dir_frame, text="视频目录:", font=ctk.CTkFont(size=14), text_color=G_TEXT,
+        ).pack(anchor="w", pady=(10, 5))
+
+        dir_row = ctk.CTkFrame(dir_frame, fg_color="transparent")
+        dir_row.pack(fill="x")
+        self.dir_entry = ctk.CTkEntry(dir_row, height=40, font=ctk.CTkFont(size=14))
+        self.dir_entry.insert(0, os.path.join(get_app_dir(), "output"))
+        self.dir_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(
+            dir_row, text="浏览...", width=80, height=40,
+            command=self._browse_dir,
+        ).pack(side="right")
+
+        # 功能选择
+        func_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
+        func_frame.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(
+            func_frame, text="处理功能:", font=ctk.CTkFont(size=14), text_color=G_TEXT,
+        ).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+
+        self.do_slides_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            func_frame, text="课件/PPT 提取 (FFmpeg GPU)", variable=self.do_slides_var,
+        ).grid(row=0, column=1, padx=15, pady=10)
+
+        self.do_transcribe_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            func_frame, text="音频转录 (Whisper GPU)", variable=self.do_transcribe_var,
+        ).grid(row=0, column=2, padx=15, pady=10)
+
+        # 转录参数
+        param_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
+        param_frame.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(
+            param_frame, text="Whisper 模型:",
+            font=ctk.CTkFont(size=14), text_color=G_TEXT,
+        ).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+
+        self.model_var = ctk.StringVar(value="large-v3")
+        self.model_menu = ctk.CTkOptionMenu(
+            param_frame, variable=self.model_var,
+            values=["tiny", "base", "small", "medium", "large-v3"],
+            width=150,
+        )
+        self.model_menu.grid(row=0, column=1, padx=10, pady=10)
+
+        ctk.CTkLabel(
+            param_frame, text="语言:",
+            font=ctk.CTkFont(size=14), text_color=G_TEXT,
+        ).grid(row=0, column=2, padx=10, pady=10, sticky="w")
+
+        self.lang_var = ctk.StringVar(value="zh")
+        self.lang_menu = ctk.CTkOptionMenu(
+            param_frame, variable=self.lang_var,
+            values=["zh", "en", "ja", "auto"],
+            width=100,
+        )
+        self.lang_menu.grid(row=0, column=3, padx=10, pady=10)
+
+        ctk.CTkLabel(
+            param_frame, text="设备:",
+            font=ctk.CTkFont(size=14), text_color=G_TEXT,
+        ).grid(row=1, column=0, padx=10, pady=10, sticky="w")
+
+        self.device_var = ctk.StringVar(value="auto" if getattr(self, "_gpu_ok", False) else "cpu")
+        self.device_menu = ctk.CTkOptionMenu(
+            param_frame, variable=self.device_var,
+            values=["auto", "cuda", "cpu"],
+            width=150,
+        )
+        self.device_menu.grid(row=1, column=1, padx=10, pady=10)
+
+        ctk.CTkLabel(
+            param_frame, text="精度:",
+            font=ctk.CTkFont(size=14), text_color=G_TEXT,
+        ).grid(row=1, column=2, padx=10, pady=10, sticky="w")
+
+        self.compute_var = ctk.StringVar(value="float16" if getattr(self, "_gpu_ok", False) else "int8")
+        self.compute_menu = ctk.CTkOptionMenu(
+            param_frame, variable=self.compute_var,
+            values=["float16", "int8", "float32"],
+            width=100,
+        )
+        self.compute_menu.grid(row=1, column=3, padx=10, pady=10)
+
+        # 开始按钮
+        self.start_btn = ctk.CTkButton(
+            self, text="开始处理", height=45,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color=G_ACCENT, hover_color="#3B83CE",
+            command=self._start_process,
+        )
+        self.start_btn.pack(pady=10, padx=40, fill="x")
+
+        # 进度条
+        progress_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
+        progress_frame.pack(fill="x", padx=20, pady=5)
+        self.progress_label = ctk.CTkLabel(
+            progress_frame, text="就绪", font=ctk.CTkFont(size=12), text_color=G_TEXT,
+        )
+        self.progress_label.pack(anchor="w", pady=(5, 2))
+        self.progress_bar = ctk.CTkProgressBar(progress_frame, height=18)
+        self.progress_bar.pack(fill="x", pady=(0, 5))
+        self.progress_bar.set(0)
+
+        # 日志
+        log_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
+        log_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        ctk.CTkLabel(
+            log_frame, text="日志:", font=ctk.CTkFont(size=12), text_color=G_TEXT,
+        ).pack(anchor="w")
+        self.log_text = ctk.CTkTextbox(log_frame, height=200, font=("Consolas", 11))
+        self.log_text.pack(fill="both", expand=True, pady=5)
+
+    def _browse_dir(self):
+        d = filedialog.askdirectory(title="选择视频目录", initialdir=self.dir_entry.get())
+        if d:
+            self.dir_entry.delete(0, "end")
+            self.dir_entry.insert(0, d)
+
+    def _detect_gpu(self):
+        """返回 (是否可用 GPU, 用户可读提示)。检测顺序: torch.cuda → nvidia-smi。"""
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0)
+                return True, f"✅ 检测到 GPU: {name}  —  Whisper 将以 float16 全速运行（约 30-50x 实时）"
+        except Exception:
+            pass
+        try:
+            import subprocess as _sp
+            r = _sp.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip():
+                return True, f"✅ 检测到 NVIDIA GPU：{r.stdout.strip().splitlines()[0]}  —  建议先安装 CUDA 12.x + cuDNN 9 以启用加速"
+        except Exception:
+            pass
+        return False, (
+            "⚠️  未检测到 GPU/CUDA — 将使用 CPU 转录（large-v3 可能很慢，建议改用 medium 或 small 模型）。\n"
+            "    GPU 用户：请安装 NVIDIA 驱动 + CUDA 12.x + cuDNN 9，并在此处选择 cuda/float16。"
+        )
+
+    def _log(self, msg: str):
+        ts = time.strftime("%H:%M:%S")
+        self.log_text.insert("end", f"[{ts}] {msg}\n")
+        self.log_text.see("end")
+
+    def _start_process(self):
+        if self.is_processing:
+            return
+        input_dir = self.dir_entry.get().strip()
+        if not input_dir or not os.path.isdir(input_dir):
+            messagebox.showerror("错误", "请选择有效的视频目录")
+            return
+        if not self.do_slides_var.get() and not self.do_transcribe_var.get():
+            messagebox.showwarning("提示", "请至少选择一项处理功能")
+            return
+
+        self.is_processing = True
+        self.start_btn.configure(state="disabled", text="处理中...")
+        self.back_btn.configure(state="disabled")
+        self._log("开始处理...")
+
+        def worker():
+            try:
+                import batch_process
+
+                def gui_progress(current, total, msg):
+                    self.after(0, lambda: self.progress_bar.set(current / total if total > 0 else 0))
+                    self.after(0, lambda m=msg: self.progress_label.configure(text=m))
+                    self.after(0, lambda m=msg: self._log(m))
+
+                results = batch_process.batch_process_all(
+                    input_dir,
+                    do_slides=self.do_slides_var.get(),
+                    do_transcribe=self.do_transcribe_var.get(),
+                    model_size=self.model_var.get(),
+                    device=self.device_var.get(),
+                    compute_type=self.compute_var.get(),
+                    language=self.lang_var.get(),
+                    progress_callback=gui_progress,
+                )
+
+                # 汇总
+                slide_results = results.get("slides", [])
+                transcript_results = results.get("transcripts", [])
+                slide_ok = sum(1 for r in slide_results if "成功" in r.get("status", ""))
+                trans_ok = sum(1 for r in transcript_results if "成功" in r.get("status", ""))
+
+                summary = f"处理完成! 课件: {slide_ok}/{len(slide_results)}, 转录: {trans_ok}/{len(transcript_results)}"
+                self.after(0, lambda: self._log(f"✅ {summary}"))
+                self.after(0, lambda: self.progress_label.configure(text=summary))
+                self.after(0, lambda: self.progress_bar.set(1))
+
+            except ImportError as e:
+                self.after(0, lambda e=e: self._log(f"❌ 模块导入失败: {e}"))
+                self.after(0, lambda e=e: messagebox.showerror(
+                    "依赖缺失",
+                    f"缺少必要的库: {e}\n\n"
+                    "请在 GPU 环境中安装:\n"
+                    "pip install faster-whisper tqdm imagehash python-pptx"
+                ))
+            except Exception as e:
+                self.after(0, lambda e=e: self._log(f"❌ 处理失败: {e}"))
+                self.after(0, lambda e=e: messagebox.showerror("处理失败", str(e)[:300]))
+            finally:
+                self.after(0, lambda: self.start_btn.configure(state="normal", text="开始处理"))
+                self.after(0, lambda: self.back_btn.configure(state="normal"))
+                self.is_processing = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
 class YanheDownloaderApp(ctk.CTk):
     """主应用程序"""
     def __init__(self):
         super().__init__()
         
-        self.title("延河课堂下载器 - Enhanced Edition")
+        self.title(f"延河课堂下载器 - {edition_label()}")
         self.geometry("900x700")
         self.minsize(800, 600)
         
@@ -1149,7 +1422,8 @@ class YanheDownloaderApp(ctk.CTk):
         self.clear_container()
         self.login_frame = LoginFrame(
             self.container, 
-            on_login_success=self.show_course_select
+            on_login_success=self.show_course_select,
+            on_post_process=self.show_post_process
         )
         self.login_frame.pack(fill="both", expand=True)
         logger.info("登录界面已显示")
@@ -1190,6 +1464,15 @@ class YanheDownloaderApp(ctk.CTk):
             on_complete=self.show_login
         )
         self.download_frame.pack(fill="both", expand=True)
+
+    def show_post_process(self):
+        logger.info("显示后处理工具界面")
+        self.clear_container()
+        self.postprocess_frame = PostProcessFrame(
+            self.container,
+            on_back=self.show_login
+        )
+        self.postprocess_frame.pack(fill="both", expand=True)
 
 
 def main():

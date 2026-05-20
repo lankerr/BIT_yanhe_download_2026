@@ -169,21 +169,31 @@ def get_audio_url(video_id):
     res = requests.get(
         f"https://cbiz.yanhekt.cn/v1/video?id={video_id}",
         headers=headers,
+        timeout=(10, 30),
     )
     return res.json()["data"].get("audio", "")
 
 
-def download_audio(url, path, name):
+def download_audio(url, path, name, max_retries=3):
     token = getToken()
     url = add_signature_for_url(url, token, *getSignature())
     _headers = headers.copy()
     _headers["Host"] = "cvideo.yanhekt.cn"
-    res = requests.get(url, headers=_headers)
-    while res.status_code != 200:
-        time.sleep(0.1)
-        res = requests.get(url, headers=_headers)
-    with open(f"{path}/{name}.aac", "wb") as f:
-        f.write(res.content)
+    for attempt in range(max_retries):
+        try:
+            res = requests.get(url, headers=_headers, timeout=(10, 120))
+            if res.status_code == 200:
+                with open(f"{path}/{name}.aac", "wb") as f:
+                    f.write(res.content)
+                return
+            else:
+                print(f"[download_audio] HTTP {res.status_code}, 重试 {attempt+1}/{max_retries}")
+        except requests.exceptions.Timeout:
+            print(f"[download_audio] 超时, 重试 {attempt+1}/{max_retries}")
+        except Exception as e:
+            print(f"[download_audio] 错误: {e}, 重试 {attempt+1}/{max_retries}")
+        time.sleep(1)
+    print(f"[download_audio] 音频下载失败: {name}")
 
 
 def print_help(f: callable):
