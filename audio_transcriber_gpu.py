@@ -46,6 +46,8 @@ DEFAULT_BEAM_SIZE = 5
 DEFAULT_VAD_FILTER = True  # 启用 VAD 过滤静音段
 SUPPORTED_AUDIO_EXT = {".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma"}
 SUPPORTED_VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".ts"}
+LONG_AUDIO_CHUNK_SECONDS = 20 * 60
+LONG_AUDIO_CHUNK_THRESHOLD_SECONDS = 30 * 60
 
 
 def check_ffmpeg() -> bool:
@@ -153,6 +155,28 @@ def extract_audio_from_video(video_path: str, output_audio: str = None,
     except subprocess.CalledProcessError as e:
         print(f"音频提取失败: {e.stderr.decode('utf-8', errors='replace')}")
         raise RuntimeError(f"FFmpeg 提取音频失败: {e}")
+
+
+def extract_audio_chunk(audio_path: str, output_audio: str, start: float, duration: float) -> str:
+    """Extract a bounded WAV chunk so long lectures do not exhaust Whisper memory."""
+    cmd = [
+        ffmpeg_path(), "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start:.3f}",
+        "-t", f"{duration:.3f}",
+        "-i", audio_path,
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        "-y",
+        output_audio,
+    ]
+    subprocess.run(
+        cmd,
+        capture_output=True,
+        check=True,
+        timeout=max(300, int(duration * 2)),
+    )
+    return output_audio
 
 
 def format_timestamp_srt(seconds: float) -> str:
@@ -286,54 +310,91 @@ class AudioTranscriber:
 
         # 执行转录
         start_time = time.time()
-        segments_iter, info = self.model.transcribe(
-            actual_audio,
-            language=self.language,
-            beam_size=self.beam_size,
-            vad_filter=self.vad_filter,
-            vad_parameters=dict(
-                min_silence_duration_ms=2000,
-                speech_pad_ms=400,
-            ),
-            condition_on_previous_text=False,
-        )
-
-        detected_lang = info.language
-        lang_prob = info.language_probability
-        print(f"检测语言: {detected_lang} (置信度: {lang_prob:.2%})")
-
-        # 收集所有段落
+        detected_lang = self.language or "unknown"
+        lang_prob = 0.0
         segments = []
         full_text_parts = []
 
         # tqdm 进度条（按音频秒数跟踪）
         pbar = None
+        last_pos = 0
         if HAS_TQDM and duration > 0:
             pbar = tqdm(total=int(duration), unit="s", desc="转录中",
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}, {rate_fmt}]")
-            last_pos = 0
 
-        for seg in segments_iter:
-            segments.append((seg.start, seg.end, seg.text.strip()))
-            full_text_parts.append(seg.text.strip())
+        def consume_transcription(source_path: str, offset: float = 0.0) -> None:
+            nonlocal detected_lang, lang_prob, last_pos
+            segments_iter, info = self.model.transcribe(
+                source_path,
+                language=self.language,
+                beam_size=self.beam_size,
+                vad_filter=self.vad_filter,
+                vad_parameters=dict(
+                    min_silence_duration_ms=2000,
+                    speech_pad_ms=400,
+                ),
+                condition_on_previous_text=False,
+            )
+            detected_lang = info.language
+            lang_prob = info.language_probability
 
-            # 更新 tqdm
-            if pbar is not None:
-                new_pos = min(int(seg.end), int(duration))
-                pbar.update(new_pos - last_pos)
-                last_pos = new_pos
+            for seg in segments_iter:
+                start = max(0.0, min(duration, offset + seg.start))
+                end = max(start, min(duration, offset + seg.end))
+                text = seg.text.strip()
+                if not text:
+                    continue
+                segments.append((start, end, text))
+                full_text_parts.append(text)
 
-            # 更新进度回调（GUI用）
-            if duration > 0 and progress_callback:
-                progress = min(95, int(5 + 90 * seg.end / duration))
-                progress_callback(
-                    progress, 100,
-                    f"转录中 {format_timestamp_readable(seg.end)}/{duration_str}..."
-                )
+                if pbar is not None:
+                    new_pos = min(int(end), int(duration))
+                    if new_pos > last_pos:
+                        pbar.update(new_pos - last_pos)
+                        last_pos = new_pos
 
-            # 无tqdm时的回退打印
-            if pbar is None and len(segments) % 10 == 0:
-                print(f"  已转录 {len(segments)} 段, 到 {format_timestamp_readable(seg.end)}")
+                if duration > 0 and progress_callback:
+                    progress = min(95, int(5 + 90 * end / duration))
+                    progress_callback(
+                        progress, 100,
+                        f"转录中 {format_timestamp_readable(end)}/{duration_str}..."
+                    )
+
+                if pbar is None and len(segments) % 10 == 0:
+                    print(f"  已转录 {len(segments)} 段, 到 {format_timestamp_readable(end)}")
+
+        if duration >= LONG_AUDIO_CHUNK_THRESHOLD_SECONDS:
+            import shutil
+            import tempfile
+
+            chunk_seconds = LONG_AUDIO_CHUNK_SECONDS
+            chunk_total = int((duration + chunk_seconds - 1) // chunk_seconds)
+            chunk_dir = tempfile.mkdtemp(prefix="yhkt_whisper_chunks_")
+            print(f"长音频分块转写: {chunk_total} 段, 每段约 {chunk_seconds // 60} 分钟")
+            try:
+                offset = 0.0
+                chunk_index = 1
+                while offset < duration:
+                    chunk_len = min(chunk_seconds, duration - offset)
+                    chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_index:03d}.wav")
+                    print(
+                        f"  分块 {chunk_index}/{chunk_total}: "
+                        f"{format_timestamp_readable(offset)}-{format_timestamp_readable(offset + chunk_len)}"
+                    )
+                    extract_audio_chunk(actual_audio, chunk_path, offset, chunk_len)
+                    consume_transcription(chunk_path, offset)
+                    try:
+                        os.remove(chunk_path)
+                    except OSError:
+                        pass
+                    offset += chunk_len
+                    chunk_index += 1
+            finally:
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+        else:
+            consume_transcription(actual_audio, 0.0)
+
+        print(f"检测语言: {detected_lang} (置信度: {lang_prob:.2%})")
 
         if pbar is not None:
             pbar.update(int(duration) - last_pos)  # 补齐到100%

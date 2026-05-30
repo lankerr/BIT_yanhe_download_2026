@@ -39,6 +39,9 @@ whisper_models/
 # 敏感信息 / 用户配置
 auth.txt
 **/auth.txt
+auth.txt.bak
+**/auth.txt.bak
+download_history.json
 down_list.txt
 down_list_orig.txt
 
@@ -75,3 +78,24 @@ video2pdf/
 extract-video-ppt/
 fast_scene_detection/
 sar_pyscenedetect/
+
+# ---- 研究/对比项目（克隆到本地用于参考，不入库）----
+refs/
+
+# ---- benchmark 与 E2E 跑批产物 ----
+runs/
+bench/results/
+runs_e2e_*.log
+
+# ---- 浏览器登录持久化 ----
+browser_profile/
+cookies.pkl
+
+# ---- 第三方下载器二进制（aria2c / N_m3u8DL-RE） ----
+tools/
+
+# ---- 发布产物（exe / 大体积打包件，不入库，走 GitHub Releases）----
+release-assets/
+
+# ---- 浏览器自动化本地缓存 ----
+cookies.pkl

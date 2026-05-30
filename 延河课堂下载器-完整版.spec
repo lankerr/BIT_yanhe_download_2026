@@ -2,10 +2,15 @@
 """
 延河课堂下载器 - 完整版
 包含下载 + 课件提取 (FFmpeg scene) + 音频转录 (faster-whisper)。
-体积 ~500MB（不含 Whisper 模型，首次启动自动下载到 %APPDATA%）。
-打包命令： pyinstaller --noconfirm --clean 延河课堂下载器-完整版.spec
+体积约 500MB，不内置 Whisper 模型，首次转录时模型会下载到本机缓存。
+打包命令：pyinstaller --noconfirm --clean 延河课堂下载器-完整版.spec
 """
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 import os
 
 block_cipher = None
@@ -21,31 +26,55 @@ hiddenimports = [
     'requests', 'urllib3', 'charset_normalizer', 'idna', 'certifi',
     'tkinter', 'tkinter.ttk', 'tkinter.messagebox', 'tkinter.filedialog',
     'queue', 'threading', 'concurrent.futures',
-    'app_paths', 'utils', 'm3u8dl',
+    'app_paths', 'utils', 'm3u8dl', 'history',
     'ppt_extractor_gpu', 'audio_transcriber_gpu', 'batch_process',
     'cv2', 'numpy', 'imagehash', 'pptx',
     'faster_whisper', 'ctranslate2', 'tokenizers', 'huggingface_hub',
     'tqdm',
 ]
 
-for _pkg in ('customtkinter', 'faster_whisper', 'ctranslate2',
-             'huggingface_hub', 'tokenizers', 'pptx'):
-    try:
-        _d, _b, _h = collect_all(_pkg)
-        datas += _d
-        binaries += _b
-        hiddenimports += _h
-    except Exception as _e:
-        print(f"[spec] collect_all({_pkg!r}) failed: {_e}")
+_d, _b, _h = collect_all('customtkinter')
+datas += _d
+binaries += _b
+hiddenimports += _h
 
-# Whisper 子模块通常通过 importlib 动态导入，必须 collect_submodules 兜底
-hiddenimports += collect_submodules('faster_whisper')
+for _pkg in ('faster_whisper', 'ctranslate2', 'tokenizers'):
+    try:
+        datas += collect_data_files(_pkg)
+        binaries += collect_dynamic_libs(_pkg)
+        hiddenimports += collect_submodules(_pkg)
+    except Exception as _e:
+        print(f"[spec] collect {_pkg!r} failed: {_e}")
+
+# Avoid collecting huggingface_hub CLI/inference extras; faster-whisper only needs
+# model-cache/download helpers.
+hiddenimports += [
+    'huggingface_hub',
+    'huggingface_hub.constants',
+    'huggingface_hub.errors',
+    'huggingface_hub.file_download',
+    'huggingface_hub.hf_api',
+    'huggingface_hub.utils',
+    'huggingface_hub.utils._auth',
+    'huggingface_hub.utils._cache_manager',
+    'huggingface_hub.utils._headers',
+    'huggingface_hub.utils._http',
+    'huggingface_hub.utils._runtime',
+    'huggingface_hub.utils._validators',
+]
 
 excludes = [
-    'pandas', 'matplotlib', 'scipy', 'sklearn',
-    'tensorflow', 'transformers',
+    'torch', 'torchaudio', 'torchvision',
+    'tensorflow', 'transformers', 'onnxruntime',
+    'pandas', 'matplotlib', 'scipy', 'sklearn', 'skimage',
+    'bokeh', 'panel', 'plotly', 'dask', 'distributed', 'xarray',
+    'selenium', 'sqlalchemy', 'h5py', 'nltk', 'spacy',
+    'numba', 'llvmlite', 'astropy',
+    'PyQt5', 'qtpy', 'PySide6', 'PySide2',
+    'pytest', 'sphinx', 'nbconvert', 'nbformat',
     'IPython', 'jupyter', 'notebook',
-    'torch.distributions', 'torch.utils.tensorboard',
+    'boto3', 'botocore', 's3transfer',
+    'fastapi', 'uvicorn', 'gradio',
 ]
 
 a = Analysis(

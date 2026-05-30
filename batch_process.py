@@ -213,14 +213,7 @@ def batch_transcribe_videos(
     print(f"模型: {model_size}, 设备: {device}")
     print(f"{'=' * 60}")
 
-    transcriber = transcriber_mod.AudioTranscriber(
-        model_size=model_size,
-        device=device,
-        compute_type=compute_type,
-        language=language,
-    )
-    transcriber.load_model(progress_callback)
-
+    transcriber = None
     results = []
     for i, video_path in enumerate(mp4_files):
         video_name = Path(video_path).stem
@@ -238,6 +231,14 @@ def batch_transcribe_videos(
 
         start = time.time()
         try:
+            if transcriber is None:
+                transcriber = transcriber_mod.AudioTranscriber(
+                    model_size=model_size,
+                    device=device,
+                    compute_type=compute_type,
+                    language=language,
+                )
+
             def file_progress(current, total, msg,
                               idx=i, count=len(mp4_files)):
                 if progress_callback:

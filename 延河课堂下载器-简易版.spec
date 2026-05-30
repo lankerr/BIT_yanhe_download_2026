@@ -22,7 +22,7 @@ hiddenimports = [
     'charset_normalizer', 'idna', 'certifi',
     'tkinter', 'tkinter.ttk', 'tkinter.messagebox', 'tkinter.filedialog',
     'queue', 'threading', 'concurrent.futures',
-    'app_paths', 'utils', 'm3u8dl',
+    'app_paths', 'utils', 'm3u8dl', 'history', 'theme',
 ]
 _d, _b, _h = collect_all('customtkinter')
 datas += _d; binaries += _b; hiddenimports += _h

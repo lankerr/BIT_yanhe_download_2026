@@ -75,6 +75,13 @@ except Exception as e:
     logger.error(f"m3u8dl 模块加载失败: {e}")
     raise
 
+try:
+    import history as download_history
+    logger.info("history 模块加载成功")
+except Exception as e:
+    logger.error(f"history 模块加载失败: {e}")
+    download_history = None  # type: ignore
+
 # 设置外观（GitHub Dark / Grok 风格）
 ctk.set_appearance_mode("dark")
 # 使用内置主题，并在组件上覆盖关键色彩以呈现极客黑风格
@@ -82,14 +89,15 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 logger.info("CustomTkinter 主题设置完成")
 
-# 统一配色常量
-G_BG = "#0d1117"
-G_PANEL = "#161b22"
-G_TEXT = "#c9d1d9"
-G_ACCENT = "#58a6ff"
-G_SUCCESS = "#3fb950"
-G_WARN = "#f2cc60"
-G_ERROR = "#f85149"
+# ---------- 主题配色（Antigravity 风格，DaisyUI dark）----------
+# 真正的色板定义在 theme.py，这里 import 进来。
+from theme import (  # noqa: E402
+    THEME,
+    G_BG, G_PANEL, G_PANEL_HI, G_BORDER,
+    G_TEXT, G_TEXT_DIM,
+    G_ACCENT, G_ACCENT_H,
+    G_SUCCESS, G_WARN, G_ERROR,
+)
 
 
 class DownloadTask:
@@ -111,7 +119,7 @@ class DownloadTask:
         self.error_msg = ""
         self.current_threads = 0
         self.max_threads = 0
-        self.max_workers = 64  # 默认并发上限，与CLI保持一致
+        self.max_workers = 16  # 默认并发，docs/speed_stage4_fullseg.md 实测饱和点
 
 
 class LoginFrame(ctk.CTkFrame):
@@ -135,27 +143,52 @@ class LoginFrame(ctk.CTkFrame):
         self.subtitle = ctk.CTkLabel(
             self, text="多线程自适应下载 · Watchdog监控 · 关键帧提取",
             font=ctk.CTkFont(size=12),
-            text_color="#8b949e"
+            text_color=G_TEXT_DIM
         )
         self.subtitle.pack(pady=(0, 30))
+
+        # 网络诊断横幅（VPN/代理/WAF 检测）—— 启动时异步探测，发现问题再显示
+        self.net_banner: ctk.CTkFrame | None = None
+        self._schedule_network_check()
         
         # 课程ID输入
         self.course_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
         self.course_frame.pack(fill="x", padx=40, pady=10)
-        
+
         self.course_label = ctk.CTkLabel(
-            self.course_frame, text="课程ID:", 
+            self.course_frame, text="课程ID:",
             font=ctk.CTkFont(size=14), text_color=G_TEXT
         )
         self.course_label.pack(anchor="w", pady=(10, 5))
-        
+
+        # 输入框 + 历史下拉按钮
+        course_row = ctk.CTkFrame(self.course_frame, fg_color="transparent")
+        course_row.pack(fill="x", pady=(0, 10))
+
         self.course_entry = ctk.CTkEntry(
-            self.course_frame, 
+            course_row,
             placeholder_text="输入5位课程编号，如 40524",
             height=40,
             font=ctk.CTkFont(size=14)
         )
-        self.course_entry.pack(fill="x", pady=(0, 10))
+        self.course_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        self.history_btn = ctk.CTkButton(
+            course_row,
+            text="▼ 历史",
+            width=80,
+            height=40,
+            font=ctk.CTkFont(size=13),
+            fg_color=G_PANEL_HI,
+            hover_color=G_BORDER,
+            text_color=G_TEXT,
+            command=self.toggle_history_panel,
+        )
+        self.history_btn.pack(side="right")
+
+        # 历史下拉面板（默认折叠，展开时插入到 course_frame 末尾）
+        self.history_panel = None
+        self.history_panel_visible = False
 
         # 输出目录选择
         self.output_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
@@ -207,7 +240,7 @@ class LoginFrame(ctk.CTkFrame):
         self.token_entry.pack(fill="x", pady=(0, 5))
 
         # Token获取代码和复制按钮
-        code_frame = ctk.CTkFrame(self.token_frame, fg_color="#0d1117")
+        code_frame = ctk.CTkFrame(self.token_frame, fg_color=THEME["code_bg"])
         code_frame.pack(fill="x", pady=(5, 10))
 
         # 代码显示
@@ -215,7 +248,7 @@ class LoginFrame(ctk.CTkFrame):
             code_frame,
             text="javascript:alert(JSON.parse(localStorage.auth).token)",
             font=ctk.CTkFont(size=11, family="Consolas"),
-            text_color="#58a6ff",
+            text_color=THEME["code_text"],
             anchor="w"
         )
         self.code_label.pack(side="left", fill="x", expand=True, padx=10, pady=8)
@@ -227,8 +260,8 @@ class LoginFrame(ctk.CTkFrame):
             width=70,
             height=28,
             font=ctk.CTkFont(size=11),
-            fg_color="#238636",
-            hover_color="#2ea043",
+            fg_color=G_SUCCESS,
+            hover_color=THEME["accent_h"],
             command=self.copy_token_code
         )
         self.copy_btn.pack(side="right", padx=5, pady=5)
@@ -243,7 +276,7 @@ class LoginFrame(ctk.CTkFrame):
             self.token_frame,
             text=method_text,
             font=ctk.CTkFont(size=9),
-            text_color="#8b949e",
+            text_color=G_TEXT_DIM,
             anchor="w",
             justify="left"
         )
@@ -260,7 +293,7 @@ class LoginFrame(ctk.CTkFrame):
             height=45,
             font=ctk.CTkFont(size=16, weight="bold"),
             fg_color=G_ACCENT,
-            hover_color="#3B83CE",
+            hover_color=G_ACCENT_H,
             command=self.fetch_course
         )
         self.fetch_btn.pack(pady=(30, 10), padx=40, fill="x")
@@ -271,8 +304,8 @@ class LoginFrame(ctk.CTkFrame):
                 self, text="🔧 后处理工具 (课件提取 + 音频转录)",
                 height=40,
                 font=ctk.CTkFont(size=14),
-                fg_color="#238636",
-                hover_color="#2ea043",
+                fg_color=THEME["accent"],
+                hover_color=THEME["accent_h"],
                 command=self._open_post_process
             )
             self.postprocess_btn.pack(pady=(0, 10), padx=40, fill="x")
@@ -285,6 +318,20 @@ class LoginFrame(ctk.CTkFrame):
         )
         self.status_label.pack(pady=10)
         logger.info("LoginFrame 初始化完成")
+
+        # 截图 / 演示模式：启动后自动展开历史面板，便于生成文档示意图
+        if os.environ.get("YHKT_DEMO_HISTORY") == "1":
+            self.after(800, self._show_history_panel)
+
+        # 演示模式：模拟 WAF 风控横幅 + 自动重试倒计时
+        if os.environ.get("YHKT_DEMO_WAF") == "1":
+            self.after(800, lambda: self._render_net_banner(
+                {"enabled": True, "server": "127.0.0.1:7890", "source": "winreg"},
+                {"ok": False, "http_status": 200, "code": 61101114,
+                 "message": "系统繁忙", "error": ""},
+            ))
+            # 1.5s 后模拟点"自动重试"
+            self.after(1500, self._start_waf_retry)
     
     def fetch_course(self):
         course_id = self.course_entry.get().strip()
@@ -346,11 +393,11 @@ class LoginFrame(ctk.CTkFrame):
                     if "ProxyError" in error_msg or "proxy" in error_msg.lower():
                         self.after(0, lambda: self.show_error(
                             "代理/VPN 连接错误",
-                            "检测到您可能开启了VPN或代理，这会导致连接延河课堂失败。\n\n"
-                            "解决方案：\n"
-                            "1. 关闭VPN或代理软件\n"
-                            "2. 或者在代理设置中将 yanhekt.cn 加入白名单\n"
-                            "3. 确保能正常访问 https://www.yanhekt.cn"
+                            "下载器已默认绕过系统代理直连延河域名，但当前网络仍返回了代理/VPN错误。\n\n"
+                            "建议：\n"
+                            "1. 将 yanhekt.cn 和 cvideo.yanhekt.cn 加入代理/VPN 直连白名单\n"
+                            "2. 或临时关闭代理/VPN 后重试\n"
+                            "3. 确保浏览器能正常访问 https://www.yanhekt.cn"
                         ))
                     elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
                         self.after(0, lambda: self.show_error(
@@ -359,20 +406,20 @@ class LoginFrame(ctk.CTkFrame):
                             "可能原因：\n"
                             "1. 网络连接不稳定\n"
                             "2. 延河课堂服务器暂时不可用\n"
-                            "3. 开启了VPN/代理导致连接问题\n\n"
-                            "建议：关闭VPN后重试"
+                            "3. VPN/代理规则拦截了直连请求\n\n"
+                            "建议：将 yanhekt.cn / cvideo.yanhekt.cn 加入直连白名单后重试"
                         ))
                     elif "SSLError" in error_msg or "certificate" in error_msg.lower():
                         self.after(0, lambda: self.show_error(
                             "SSL证书错误",
                             "HTTPS连接失败，可能是代理软件拦截了请求。\n\n"
-                            "解决方案：关闭VPN或代理软件后重试"
+                            "解决方案：将延河域名加入代理/VPN 直连白名单，或临时关闭代理/VPN 后重试"
                         ))
                     else:
                         self.after(0, lambda e=error_msg: self.show_error(
                             "网络连接错误",
                             f"无法连接到延河课堂：\n{e[:200]}\n\n"
-                            "建议：检查网络连接，关闭VPN后重试"
+                            "建议：检查网络连接；如使用 VPN/代理，请将延河域名加入直连白名单"
                         ))
                     self.after(0, lambda: self.fetch_btn.configure(state="normal"))
                     return
@@ -423,6 +470,12 @@ class LoginFrame(ctk.CTkFrame):
                 
                 # 成功，切换到选择界面
                 logger.info("准备切换到课程选择界面")
+                # 写入下载历史（失败不影响主流程）
+                if download_history is not None:
+                    try:
+                        download_history.add_entry(course_id, course_name, professor)
+                    except Exception as _hist_err:
+                        logger.warning(f"写入下载历史失败: {_hist_err}")
                 self.after(0, lambda: self.on_login_success(
                     course_id, video_list, course_name, professor
                 ))
@@ -434,7 +487,8 @@ class LoginFrame(ctk.CTkFrame):
                 if "ProxyError" in error_msg or "proxy" in error_msg.lower():
                     self.after(0, lambda: self.show_error(
                         "VPN/代理错误", 
-                        "请关闭VPN或代理软件后重试。\n延河课堂需要直连访问。"
+                        "下载器已默认绕过系统代理直连延河域名。\n"
+                        "如果仍失败，请把 yanhekt.cn 和 cvideo.yanhekt.cn 加入代理/VPN 直连白名单，或临时关闭代理/VPN 后重试。"
                     ))
                 elif "没有视频信息" in error_msg or "课程ID" in error_msg:
                     self.after(0, lambda e=error_msg: self.show_error(
@@ -443,7 +497,7 @@ class LoginFrame(ctk.CTkFrame):
                 else:
                     self.after(0, lambda e=error_msg: self.show_error(
                         "获取课程失败", 
-                        f"{e[:150]}\n\n常见解决方案：\n1. 检查课程ID是否正确\n2. 关闭VPN/代理\n3. 重新获取Token"
+                        f"{e[:150]}\n\n常见解决方案：\n1. 检查课程ID是否正确\n2. 将延河域名加入代理/VPN直连白名单\n3. 重新获取Token"
                     ))
                 self.after(0, lambda: self.fetch_btn.configure(state="normal"))
         
@@ -469,9 +523,9 @@ class LoginFrame(ctk.CTkFrame):
         self.clipboard_append(code)
         self.update()  # 保持剪贴板内容
         # 显示复制成功提示
-        self.copy_btn.configure(text="已复制!", fg_color="#3fb950", hover_color="#3fb950")
+        self.copy_btn.configure(text="已复制!", fg_color=G_SUCCESS, hover_color=G_SUCCESS)
         self.after(2000, lambda: self.copy_btn.configure(
-            text="复制代码", fg_color="#238636", hover_color="#2ea043"
+            text="复制代码", fg_color=G_SUCCESS, hover_color=THEME["accent_h"]
         ))
 
     def show_error(self, title: str, message: str):
@@ -483,6 +537,560 @@ class LoginFrame(ctk.CTkFrame):
         """打开后处理工具"""
         if self.on_post_process:
             self.on_post_process()
+
+    # ---------- 网络/代理诊断 ----------
+    def _schedule_network_check(self):
+        """LoginFrame 启动 600ms 后异步做一次网络检测，避免阻塞 UI。"""
+        try:
+            self.after(600, self._run_network_check_async)
+        except Exception:
+            pass
+
+    def _run_network_check_async(self):
+        def _job():
+            sys_proxy = utils._detect_system_proxy()
+            probe = utils.probe_yanhe_reachable(timeout=8)
+            self.after(0, lambda: self._render_net_banner(sys_proxy, probe))
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _render_net_banner(self, sys_proxy: dict, probe: dict):
+        """根据探测结果在 token 区上方显示提示横幅。
+        - 探活通：绿色一行紧凑显示
+        - 探活失败但系统代理开着：黄色，建议加白名单或临时关代理
+        - 探活失败且没代理：橙色，token 可能过期或被风控
+        """
+        # 清掉旧的
+        if self.net_banner is not None:
+            try: self.net_banner.destroy()
+            except Exception: pass
+            self.net_banner = None
+
+        proxy_on = sys_proxy.get("enabled")
+        code = probe.get("code")
+        http_status = probe.get("http_status")
+        err = probe.get("error")
+
+        # 三态判定
+        if probe.get("ok"):
+            state = "ok"
+            title = "🟢 Token 正常 · 网络通畅"
+            detail = f"模式：{utils._net_mode()}    " + (
+                f"系统代理：{sys_proxy.get('server','—')}" if proxy_on else "未走代理"
+            )
+            color = G_SUCCESS
+        elif err:
+            state = "neterr"
+            title = "🔴 网络无法连通延河课堂"
+            detail = (
+                f"{err}\n排查：检查网络是否能访问 https://www.yanhekt.cn"
+            )
+            color = G_ERROR
+        elif code == 61101114 or "系统繁忙" in (probe.get("message") or ""):
+            state = "waf"
+            if proxy_on:
+                title = "🟡 检测到 VPN/代理 + 延河 WAF 拒绝"
+                detail = (
+                    f"代理：{sys_proxy.get('server','')} · 来源：{sys_proxy.get('source','')}\n"
+                    "可选操作：\n"
+                    "  1) 把 *.yanhekt.cn 加入 Clash/V2Ray 直连规则\n"
+                    "  2) 临时关闭系统代理后重试\n"
+                    "  3) 在「网络」里改用「跟随系统代理」模式"
+                )
+                color = G_WARN
+            else:
+                title = "🟡 Token 已被风控或过期"
+                detail = (
+                    "WAF 静默拒绝（HTTP 200 + code=61101114）。\n"
+                    "原因：Token 短时间被探活过多 / 已超 24 小时。\n"
+                    "建议：浏览器重新登录延河 → F12 控制台脚本拿新 32 位 Token，\n"
+                    "或点「自动重试」等待限流窗口过期（5-15 分钟）。"
+                )
+                color = G_WARN
+        elif code in (401, 403) or http_status in (401, 403):
+            state = "unauth"
+            title = "🔴 Token 未授权 / 已失效"
+            detail = "请重新拿 Token：浏览器 F12 控制台 → JSON.parse(localStorage.auth).token"
+            color = G_ERROR
+        else:
+            state = "unknown"
+            title = f"🟡 网络异常（HTTP {http_status}, code={code}）"
+            detail = (probe.get("message") or "")[:200]
+            color = G_WARN
+
+        banner = ctk.CTkFrame(self, fg_color=G_PANEL, border_color=color, border_width=1)
+        banner.pack(fill="x", padx=40, pady=(0, 10))
+        self.net_banner = banner
+
+        # 顶部一行：状态 + 折叠/展开
+        top = ctk.CTkFrame(banner, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(6, 2))
+        ctk.CTkLabel(
+            top, text=title,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=color, anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+
+        # 绿色状态紧凑模式：detail 用小字单行；失败状态展开多行 + 操作按钮
+        if state == "ok":
+            ctk.CTkLabel(
+                banner, text=detail,
+                font=ctk.CTkFont(size=10),
+                text_color=G_TEXT_DIM, anchor="w",
+            ).pack(fill="x", padx=12, pady=(0, 6))
+            return
+
+        ctk.CTkLabel(
+            banner, text=detail,
+            font=ctk.CTkFont(size=11),
+            text_color=G_TEXT, anchor="w", justify="left",
+        ).pack(fill="x", padx=12, pady=(0, 6))
+
+        # 操作按钮区
+        btnrow = ctk.CTkFrame(banner, fg_color="transparent")
+        btnrow.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkButton(
+            btnrow, text="网络设置...", height=28, width=110,
+            fg_color=G_PANEL_HI, hover_color=G_BORDER, text_color=G_TEXT,
+            command=self._open_network_dialog,
+        ).pack(side="left", padx=4)
+        if state == "waf" and proxy_on:
+            ctk.CTkButton(
+                btnrow, text="复制 Clash 直连规则", height=28, width=160,
+                fg_color=G_PANEL_HI, hover_color=G_BORDER, text_color=G_TEXT,
+                command=self._copy_clash_rule,
+            ).pack(side="left", padx=4)
+        if state == "waf":
+            ctk.CTkButton(
+                btnrow, text="自动重试 (5min)", height=28, width=130,
+                fg_color=G_PANEL_HI, hover_color=G_SUCCESS, text_color=G_TEXT,
+                command=self._start_waf_retry,
+            ).pack(side="left", padx=4)
+        # 浏览器登录兜底（A 失败时这条最稳）
+        if state in ("waf", "unauth"):
+            ctk.CTkButton(
+                btnrow, text="🌐 浏览器登录", height=28, width=130,
+                fg_color=G_ACCENT, hover_color=G_ACCENT_H if 'G_ACCENT_H' in globals() else G_ACCENT,
+                text_color="#ffffff",
+                command=self._launch_browser_login,
+            ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btnrow, text="重新检测", height=28, width=90,
+            fg_color=G_PANEL_HI, hover_color=G_BORDER, text_color=G_TEXT,
+            command=self._run_network_check_async,
+        ).pack(side="left", padx=4)
+
+    # ---------- WAF 指数退避自动重试 ----------
+    def _start_waf_retry(self):
+        """启动一个后台线程，按 30s/60s/2min/5min/10min 重试探活，成功就提示用户。"""
+        if getattr(self, "_waf_retry_thread", None) and self._waf_retry_thread.is_alive():
+            messagebox.showinfo("提示", "已经在自动重试中")
+            return
+
+        delays = [30, 60, 120, 300, 600]   # 5 次重试
+
+        def _job():
+            for i, d in enumerate(delays, 1):
+                # 倒计时
+                remain = d
+                while remain > 0:
+                    self.after(0, self._update_retry_countdown, i, len(delays), remain)
+                    time.sleep(1)
+                    remain -= 1
+                # 跑一次 probe
+                probe = utils.probe_yanhe_reachable(timeout=8)
+                if probe.get("ok"):
+                    self.after(0, self._on_retry_success, probe)
+                    return
+            self.after(0, self._on_retry_exhausted)
+
+        self._waf_retry_thread = threading.Thread(target=_job, daemon=True)
+        self._waf_retry_thread.start()
+        # 立即在 status_label 显示
+        self.status_label.configure(
+            text=f"⏳ 自动重试中... 第 1/{len(delays)} 次，{delays[0]} 秒后",
+            text_color=G_WARN,
+        )
+
+    def _update_retry_countdown(self, attempt: int, total: int, remain: int):
+        try:
+            self.status_label.configure(
+                text=f"⏳ 自动重试中... 第 {attempt}/{total} 次，{remain} 秒后",
+                text_color=G_WARN,
+            )
+        except Exception:
+            pass
+
+    def _on_retry_success(self, probe: dict):
+        self.status_label.configure(
+            text="✅ Token 恢复正常，可以继续",
+            text_color=G_SUCCESS,
+        )
+        # 触发横幅重渲染（应该变绿）
+        sys_proxy = utils._detect_system_proxy()
+        self._render_net_banner(sys_proxy, probe)
+
+    def _on_retry_exhausted(self):
+        self.status_label.configure(
+            text="❌ 自动重试 5 次仍未恢复，请换新 Token 或检查网络",
+            text_color=G_ERROR,
+        )
+
+    # ---------- 浏览器登录兜底 ----------
+    def _launch_browser_login(self):
+        """启动 Chrome 让用户重新登录拿新 token，跑完自动写 auth.txt 并刷新 UI。"""
+        try:
+            import browser_auth
+        except Exception as e:
+            messagebox.showerror(
+                "浏览器登录不可用",
+                f"无法导入 browser_auth：{e}\n\n"
+                "请确保已安装 undetected-chromedriver：\n"
+                "  pip install undetected-chromedriver",
+            )
+            return
+        ok, msg = browser_auth.is_available()
+        if not ok:
+            messagebox.showwarning("浏览器登录不可用", msg)
+            return
+
+        # 给一个进度对话框
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("浏览器登录")
+        dlg.geometry("520x300")
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+
+        ctk.CTkLabel(
+            dlg, text="🌐 通过浏览器登录延河课堂",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).pack(pady=(16, 6), padx=16, anchor="w")
+
+        ctk.CTkLabel(
+            dlg, text=(
+                "下载器会用 undetected_chromedriver 弹出 Chrome 窗口，\n"
+                "请在窗口里完成登录（密码 / 校园卡 / 扫码 / 人脸 任意）。\n\n"
+                "登录成功后浏览器会自动关闭，新 Token 会写入 auth.txt。\n"
+                "全程最多 4 分钟，超时会自动放弃。"
+            ),
+            font=ctk.CTkFont(size=12), text_color=G_TEXT_DIM,
+            justify="left",
+        ).pack(padx=16, anchor="w")
+
+        log_box = ctk.CTkTextbox(
+            dlg, height=100, font=ctk.CTkFont(family="Consolas", size=11),
+            fg_color=G_BG, text_color=G_TEXT,
+        )
+        log_box.pack(fill="x", padx=16, pady=10)
+
+        def _log(msg: str):
+            try:
+                log_box.insert("end", msg + "\n")
+                log_box.see("end")
+                dlg.update_idletasks()
+            except Exception:
+                pass
+
+        result_holder: dict = {}
+
+        def _job():
+            try:
+                from app_paths import get_app_dir
+                app_dir = get_app_dir()
+            except Exception:
+                app_dir = None
+            r = browser_auth.login_interactive(
+                on_log=lambda m: self.after(0, lambda mm=m: _log(mm)),
+                timeout_sec=240,
+                app_dir=app_dir,
+                headless=False,
+            )
+            result_holder["r"] = r
+            self.after(0, _on_done)
+
+        def _on_done():
+            r = result_holder.get("r") or {}
+            if r.get("ok"):
+                token = r.get("token", "")
+                # 把新 token 也填回 entry
+                try:
+                    self.token_entry.delete(0, "end")
+                    self.token_entry.insert(0, token)
+                except Exception:
+                    pass
+                _log(f"✅ 登录成功，token = {token[:8]}...{token[-4:]}")
+                _log("正在重新探活...")
+                # 强制 utils 用新 token
+                try:
+                    utils.read_auth()  # 让 utils.headers["Authorization"] 刷新
+                    utils.reset_sessions()
+                except Exception:
+                    pass
+                # 重新探活刷横幅
+                self.after(200, self._run_network_check_async)
+                self.after(800, dlg.destroy)
+            else:
+                _log("❌ 登录失败：" + (r.get("error") or "未知错误")[:200])
+                # 留对话框给用户看错误，不自动关
+
+        threading.Thread(target=_job, daemon=True).start()
+
+        # 关闭按钮
+        ctk.CTkButton(
+            dlg, text="关闭", height=32, fg_color=G_PANEL_HI,
+            hover_color=G_BORDER, text_color=G_TEXT,
+            command=dlg.destroy,
+        ).pack(padx=16, pady=(0, 12), anchor="w")
+
+    def _copy_clash_rule(self):
+        """把延河直连规则复制到剪贴板。Clash/V2Ray/sing-box 通用语法。"""
+        rules = (
+            "# 延河课堂直连（粘贴到 Clash 配置 rules: 段最前面）\n"
+            "  - DOMAIN-SUFFIX,yanhekt.cn,DIRECT\n"
+            "  - DOMAIN-SUFFIX,yhkt.cn,DIRECT\n"
+            "# 或 V2Ray (routing.rules)：\n"
+            '  {"type":"field","outboundTag":"direct","domain":["domain:yanhekt.cn","domain:yhkt.cn"]}\n'
+        )
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(rules)
+            self.update()
+            messagebox.showinfo(
+                "已复制",
+                "已复制延河直连规则到剪贴板。\n\n"
+                "粘贴到 Clash/V2Ray 的规则配置最前面，重启代理后再试。",
+            )
+        except Exception as e:
+            messagebox.showerror("复制失败", str(e))
+
+    def _open_network_dialog(self):
+        """简易的网络模式选择对话框。"""
+        win = ctk.CTkToplevel(self)
+        win.title("网络设置")
+        win.geometry("520x420")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win, text="选择网络模式",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).pack(pady=(16, 6), padx=16, anchor="w")
+
+        ctk.CTkLabel(
+            win,
+            text=(
+                "下载器与延河 API 之间的连接策略。挂 VPN/代理时请优先尝试 auto/direct，\n"
+                "若校外节点反而需要走代理才能访问延河，再切到 system 或自定义代理。"
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=G_TEXT_DIM, justify="left",
+        ).pack(padx=16, anchor="w")
+
+        cur = utils._net_mode()
+        var = ctk.StringVar(value=cur if not cur.startswith("proxy=") else "proxy_custom")
+        proxy_url_default = (cur.split("=", 1)[1]
+                             if cur.startswith("proxy=") else "http://127.0.0.1:7890")
+
+        modes = [
+            ("auto", "auto", "自动绕过代理（推荐）：requests 显式置空 proxies"),
+            ("direct", "direct", "直连+IP 锁定：再绕过 DNS 劫持"),
+            ("system", "system", "跟随系统/环境变量代理（trust_env=True）"),
+            ("proxy_custom", "proxy_custom", "自定义代理 URL ↓"),
+        ]
+        for tag, value, desc in modes:
+            r = ctk.CTkRadioButton(win, text=desc, variable=var, value=value)
+            r.pack(anchor="w", padx=24, pady=4)
+
+        proxy_entry = ctk.CTkEntry(win, height=32, placeholder_text="http://127.0.0.1:7890")
+        proxy_entry.insert(0, proxy_url_default)
+        proxy_entry.pack(fill="x", padx=40, pady=(2, 10))
+
+        result_lbl = ctk.CTkLabel(
+            win, text="", font=ctk.CTkFont(size=11), text_color=G_TEXT_DIM,
+            anchor="w", justify="left", wraplength=470,
+        )
+        result_lbl.pack(fill="x", padx=16, pady=(0, 8))
+
+        def apply_and_test():
+            mode = var.get()
+            if mode == "proxy_custom":
+                url = proxy_entry.get().strip()
+                if not url:
+                    messagebox.showerror("错误", "请填写代理 URL")
+                    return
+                os.environ["YHKT_NET_MODE"] = f"proxy={url}"
+            else:
+                os.environ["YHKT_NET_MODE"] = mode
+            utils.reset_sessions()
+
+            result_lbl.configure(text="正在测试...", text_color=G_WARN)
+
+            def _bg():
+                probe = utils.probe_yanhe_reachable(timeout=8)
+                msg = (f"模式={os.environ['YHKT_NET_MODE']}  HTTP={probe.get('http_status')}  "
+                       f"code={probe.get('code')}  msg={probe.get('message') or probe.get('error')}")
+                color = G_SUCCESS if probe.get("ok") else G_ERROR
+                self.after(0, lambda: result_lbl.configure(text=msg, text_color=color))
+                if probe.get("ok"):
+                    # 同时让外面 LoginFrame 横幅刷新
+                    self.after(50, self._run_network_check_async)
+            threading.Thread(target=_bg, daemon=True).start()
+
+        ctk.CTkButton(win, text="应用并测试", height=32, command=apply_and_test).pack(
+            padx=16, pady=(0, 8), anchor="w"
+        )
+        ctk.CTkButton(win, text="关闭", height=32, fg_color=G_PANEL_HI,
+                      hover_color=G_BORDER, text_color=G_TEXT,
+                      command=win.destroy).pack(padx=16, pady=(0, 16), anchor="w")
+
+    # ---------- 下载历史下拉面板 ----------
+    def toggle_history_panel(self):
+        """点击 ▼ 历史 按钮：展开 / 折叠面板。"""
+        if self.history_panel_visible:
+            self._hide_history_panel()
+        else:
+            self._show_history_panel()
+
+    def _show_history_panel(self):
+        items = download_history.load_history() if download_history else []
+        # 重建面板
+        if self.history_panel is not None:
+            try:
+                self.history_panel.destroy()
+            except Exception:
+                pass
+            self.history_panel = None
+
+        panel = ctk.CTkFrame(self.course_frame, fg_color=G_BG,
+                             border_width=1, border_color=G_BORDER)
+        panel.pack(fill="x", pady=(0, 10))
+
+        if not items:
+            empty = ctk.CTkLabel(
+                panel,
+                text="（暂无历史，成功获取课程列表后会自动记录）",
+                font=ctk.CTkFont(size=12),
+                text_color=G_TEXT_DIM,
+            )
+            empty.pack(padx=12, pady=12)
+        else:
+            # 滚动容器，最多显示 ~6 行
+            row_h = 38
+            visible_rows = min(len(items), 6)
+            scroll = ctk.CTkScrollableFrame(
+                panel,
+                fg_color=G_BG,
+                height=row_h * visible_rows,
+            )
+            scroll.pack(fill="x", padx=6, pady=6)
+            for it in items:
+                self._build_history_row(scroll, it)
+
+            footer = ctk.CTkFrame(panel, fg_color="transparent")
+            footer.pack(fill="x", padx=6, pady=(0, 6))
+            ctk.CTkLabel(
+                footer,
+                text=f"共 {len(items)} 条记录",
+                font=ctk.CTkFont(size=11),
+                text_color=G_TEXT_DIM,
+            ).pack(side="left", padx=4)
+            ctk.CTkButton(
+                footer, text="清空全部", width=90, height=28,
+                font=ctk.CTkFont(size=12),
+                fg_color=G_PANEL_HI, hover_color=THEME["error_h"],
+                text_color=G_ERROR,
+                command=self._clear_history,
+            ).pack(side="right", padx=4)
+
+        self.history_panel = panel
+        self.history_panel_visible = True
+        self.history_btn.configure(text="▲ 收起")
+
+    def _hide_history_panel(self):
+        if self.history_panel is not None:
+            try:
+                self.history_panel.destroy()
+            except Exception:
+                pass
+            self.history_panel = None
+        self.history_panel_visible = False
+        self.history_btn.configure(text="▼ 历史")
+
+    def _build_history_row(self, parent, item: dict):
+        cid = item.get("course_id", "")
+        cname = item.get("course_name") or "(未命名课程)"
+        prof = item.get("professor") or ""
+        last = (item.get("last_used") or "").replace("T", " ")[:16]
+        cnt = item.get("count", 1)
+
+        row = ctk.CTkFrame(parent, fg_color=G_PANEL, corner_radius=4)
+        row.pack(fill="x", padx=2, pady=2)
+
+        # 主体：点击整行回填课程 ID
+        info = ctk.CTkFrame(row, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True, padx=8, pady=4)
+
+        title = f"{cid}  ·  {cname}"
+        if prof:
+            title += f"  ·  {prof}"
+        ctk.CTkLabel(
+            info, text=title, font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=G_TEXT, anchor="w",
+        ).pack(fill="x")
+        meta = f"上次使用 {last}    使用次数 ×{cnt}" if last else f"使用次数 ×{cnt}"
+        ctk.CTkLabel(
+            info, text=meta, font=ctk.CTkFont(size=10),
+            text_color=G_TEXT_DIM, anchor="w",
+        ).pack(fill="x")
+
+        def _use(_evt=None, _cid=cid):
+            self._apply_history(_cid)
+        for w in (row, info, *info.winfo_children()):
+            try:
+                w.bind("<Button-1>", _use)
+            except Exception:
+                pass
+
+        ctk.CTkButton(
+            row, text="使用", width=56, height=28,
+            font=ctk.CTkFont(size=12),
+            fg_color=G_ACCENT, hover_color=G_ACCENT_H,
+            command=lambda _cid=cid: self._apply_history(_cid),
+        ).pack(side="right", padx=(2, 6), pady=4)
+        ctk.CTkButton(
+            row, text="删除", width=56, height=28,
+            font=ctk.CTkFont(size=12),
+            fg_color=G_PANEL_HI, hover_color=THEME["error_h"],
+            text_color=G_ERROR,
+            command=lambda _cid=cid: self._remove_history(_cid),
+        ).pack(side="right", padx=2, pady=4)
+
+    def _apply_history(self, course_id: str):
+        if not course_id:
+            return
+        self.course_entry.delete(0, "end")
+        self.course_entry.insert(0, course_id)
+        self._hide_history_panel()
+        self.status_label.configure(
+            text=f"已填入课程 {course_id}，点击「获取课程列表」继续",
+            text_color=G_ACCENT,
+        )
+
+    def _remove_history(self, course_id: str):
+        if not download_history:
+            return
+        download_history.remove_entry(course_id)
+        # 刷新面板
+        self._hide_history_panel()
+        self._show_history_panel()
+
+    def _clear_history(self):
+        if not download_history:
+            return
+        if not messagebox.askyesno("清空下载历史", "确认清空全部历史记录？此操作不可恢复。"):
+            return
+        download_history.clear_history()
+        self._hide_history_panel()
+        self._show_history_panel()
 
 
 class CourseSelectFrame(ctk.CTkFrame):
@@ -560,10 +1168,11 @@ class CourseSelectFrame(ctk.CTkFrame):
         )
         self.workers_label.grid(row=1, column=0, padx=10, pady=10, sticky="w")
 
-        self.workers_var = tk.IntVar(value=64)  # 与CLI保持一致
+        # 默认 16：docs/speed_stage4_fullseg.md 全段实测饱和点，再高无收益
+        self.workers_var = tk.IntVar(value=16)
         self.workers_value = ctk.CTkLabel(
-            self.options_frame, text="32",
-            font=ctk.CTkFont(size=12), text_color="#8b949e"
+            self.options_frame, text="16",
+            font=ctk.CTkFont(size=12), text_color=G_TEXT_DIM
         )
 
         def update_workers_label(value):
@@ -571,10 +1180,10 @@ class CourseSelectFrame(ctk.CTkFrame):
             self.workers_value.configure(text=str(int(value)))
 
         self.workers_slider = ctk.CTkSlider(
-            self.options_frame, from_=4, to=64, number_of_steps=60,
+            self.options_frame, from_=4, to=32, number_of_steps=28,
             command=update_workers_label
         )
-        self.workers_slider.set(32)
+        self.workers_slider.set(16)
         self.workers_slider.grid(row=1, column=1, columnspan=2, padx=10, pady=10, sticky="we")
         self.workers_value.grid(row=1, column=3, padx=10, pady=10, sticky="e")
         
@@ -697,7 +1306,7 @@ class DownloadFrame(ctk.CTkFrame):
         
         self.stop_btn = ctk.CTkButton(
             self.header, text="停止下载", 
-            fg_color=G_ERROR, hover_color="#a52b2b",
+            fg_color=G_ERROR, hover_color=THEME["error_h"],
             command=self.stop_download
         )
         self.stop_btn.pack(side="right")
@@ -705,7 +1314,7 @@ class DownloadFrame(ctk.CTkFrame):
         # 快捷：打开输出目录
         self.open_dir_btn = ctk.CTkButton(
             self.header, text="打开输出目录",
-            fg_color=G_ACCENT, hover_color="#3B83CE",
+            fg_color=G_ACCENT, hover_color=G_ACCENT_H,
             command=lambda: os.startfile(os.path.abspath("output")) if sys.platform.startswith("win") else None
         )
         self.open_dir_btn.pack(side="right", padx=10)
@@ -713,7 +1322,7 @@ class DownloadFrame(ctk.CTkFrame):
         # 重试失败任务
         self.retry_btn = ctk.CTkButton(
             self.header, text="重试失败任务",
-            fg_color=G_WARN, hover_color="#b49b3a",
+            fg_color=G_WARN, hover_color=THEME["warn_h"],
             command=self.retry_failed
         )
         self.retry_btn.pack(side="right", padx=10)
@@ -784,14 +1393,14 @@ class DownloadFrame(ctk.CTkFrame):
         status_label = ctk.CTkLabel(
             info_frame, text="等待中",
             font=ctk.CTkFont(size=11),
-            text_color="#8b949e"
+            text_color=G_TEXT_DIM
         )
         status_label.pack(side="left")
         
         thread_label = ctk.CTkLabel(
             info_frame, text="",
             font=ctk.CTkFont(size=11),
-            text_color="#8b949e"
+            text_color=G_TEXT_DIM
         )
         thread_label.pack(side="right")
         
@@ -819,7 +1428,7 @@ class DownloadFrame(ctk.CTkFrame):
         
         # 更新状态
         status_text = ""
-        status_color = "#8b949e"
+        status_color = G_TEXT_DIM
         if status == -2:  # 获取视频信息中
             status_text = "正在获取视频信息..."
             status_color = G_ACCENT
@@ -1142,7 +1751,7 @@ class PostProcessFrame(ctk.CTkFrame):
 
         # GPU 检测提示横幅（在创建参数控件前先决定默认设备）
         gpu_ok, gpu_msg = self._detect_gpu()
-        banner = ctk.CTkFrame(self, fg_color="#1f6feb" if gpu_ok else "#9e6a03")
+        banner = ctk.CTkFrame(self, fg_color=G_ACCENT if gpu_ok else G_WARN)
         banner.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkLabel(
             banner,
@@ -1250,7 +1859,7 @@ class PostProcessFrame(ctk.CTkFrame):
         self.start_btn = ctk.CTkButton(
             self, text="开始处理", height=45,
             font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color=G_ACCENT, hover_color="#3B83CE",
+            fg_color=G_ACCENT, hover_color=G_ACCENT_H,
             command=self._start_process,
         )
         self.start_btn.pack(pady=10, padx=40, fill="x")
