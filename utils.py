@@ -68,6 +68,81 @@ _dns_cache: dict[str, str] = {}
 _dns_cache_lock = threading.Lock()
 
 
+# ---------------- 限流感知（全局熔断 + API 限速）----------------
+# 延河 WAF 的已知行为（来自本项目实测，见 docs/ 与 probe_yanhe_reachable 注释）：
+#   - API 域 cbiz.yanhekt.cn 会按 code=61101114 / "系统繁忙" 拒绝，曾发生 token 风控
+#   - CDN 域 cvideo.yanhekt.cn 过载/限流时表现为分片 403/503/超时
+# 旧客户端的问题：一旦被限，16 个下载线程毫无感知继续硬敲，只会让封禁升级。
+# 现在的策略是"被限就全体退避"：任何线程看到限流信号 → 设置全局冷却窗口，
+# 所有出站请求等窗口结束再发；连续触发冷却时间指数增长，成功一次即恢复。
+# 这是"不触发/不升级限流"的正道，而不是对抗性绕过。
+
+class WafBreaker:
+    """全局熔断器：被限流时让所有请求统一退避。"""
+
+    def __init__(self, base_cooldown=10.0, max_cooldown=60.0):
+        self._lock = threading.Lock()
+        self._until = 0.0       # 冷却截止时间戳
+        self._level = 0         # 连续触发级别（决定冷却时长）
+        self._base = base_cooldown
+        self._max = max_cooldown
+        self.last_reason = ""
+
+    def trip(self, reason: str) -> float:
+        """触发熔断；返回本次冷却秒数。幂等：冷却期内重复触发只升级。"""
+        with self._lock:
+            self._level = min(self._level + 1, 4)
+            cooldown = min(self._base * (2 ** (self._level - 1)), self._max)
+            self._until = time.time() + cooldown
+            self.last_reason = reason
+        print(f"[限流熔断] {reason} → 全局冷却 {cooldown:.0f}s（第 {self._level} 次连续触发）")
+        return cooldown
+
+    def wait(self):
+        """请求发出前调用：处于冷却期则睡到窗口结束。"""
+        while True:
+            with self._lock:
+                remain = self._until - time.time()
+            if remain <= 0:
+                return
+            time.sleep(min(remain, 5.0))
+
+    def cooldown_remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self._until - time.time())
+
+    def report_ok(self):
+        """成功响应后调用：连续级别归零（半开恢复）。"""
+        with self._lock:
+            self._level = 0
+
+
+waf_breaker = WafBreaker()   # cbiz.yanhekt.cn（API 域）
+# cvideo CDN 分片：同样被限流时退避。注意只在 403/429/503 这类
+# 服务器拒绝信号上触发——弱网超时/断连不是限流，触发熔断反而会
+# 重演 v3 之前 AIMD 的"死亡螺旋"。
+cdn_breaker = WafBreaker(base_cooldown=10.0, max_cooldown=60.0)
+
+# cbiz API 全局最小请求间隔：课程列表/token 等低频接口不值得触发 WAF
+_api_pace_lock = threading.Lock()
+_api_last_call = 0.0
+API_MIN_INTERVAL = 0.8  # 秒
+
+
+def _pace_api():
+    """串行化 cbiz API 调用，保证全局间隔 >= API_MIN_INTERVAL。"""
+    global _api_last_call
+    while True:
+        with _api_pace_lock:
+            wait = _api_last_call + API_MIN_INTERVAL - time.time()
+            if wait <= 0:
+                _api_last_call = time.time()
+                return
+        time.sleep(min(wait, 0.5))
+
+
+
+
 def _resolve_host(host: str) -> str | None:
     """解析域名到 IPv4，命中缓存避免反复 DNS。"""
     with _dns_cache_lock:
@@ -183,8 +258,53 @@ def reset_sessions() -> None:
 
 
 def direct_get(url: str, **kwargs):
-    """GET，按当前 NET_MODE 决定走代理还是直连。"""
-    return direct_session().get(url, **kwargs)
+    """GET，按当前 NET_MODE 决定走代理还是直连；延河域名自动限流感知。
+
+    - 请求前：cbiz API 过全局熔断 + 限速；其它延河域名（cvideo 等）过 CDN 熔断
+    - 响应后：403/429/503 自动触发对应熔断；200 自动恢复（连续级别归零）
+    所有调用点（分片/m3u8/key/音频）自动获得该行为，无需各自判定。
+    """
+    try:
+        host = url.split("//", 1)[-1].split("/", 1)[0].split(":")[0]
+    except Exception:
+        host = ""
+    breaker = None
+    if host.endswith("yanhekt.cn"):
+        if host == "cbiz.yanhekt.cn":
+            waf_breaker.wait()
+            _pace_api()
+            breaker = waf_breaker
+        else:
+            cdn_breaker.wait()
+            breaker = cdn_breaker
+    resp = direct_session().get(url, **kwargs)
+    if breaker is not None:
+        if resp.status_code in (403, 429, 503):
+            breaker.trip(f"HTTP {resp.status_code} @ {host}")
+        elif resp.status_code == 200:
+            breaker.report_ok()
+    return resp
+
+
+def api_get(url: str, **kwargs):
+    """cbiz API 限流感知 GET：direct_get 之上识别 HTTP 200 里藏的 WAF 码。
+
+    延河 WAF 拒绝时常返回 HTTP 200 + code=61101114 / "系统繁忙"（见
+    probe_yanhe_reachable 的实测注释），direct_get 按 200 放行，这里补判。
+    cbiz 的 API 调用统一用这个。
+    """
+    resp = direct_get(url, **kwargs)
+    try:
+        if resp.status_code == 200 and "json" in (resp.headers.get("Content-Type") or ""):
+            d = resp.json()
+            if isinstance(d, dict):
+                code = d.get("code")
+                msg = str(d.get("message") or "")
+                if code == 61101114 or "繁忙" in msg or "频繁" in msg:
+                    waf_breaker.trip(f"code={code} {msg[:40]}".strip())
+    except Exception:
+        pass
+    return resp
 
 
 def probe_yanhe_reachable(timeout: float = 8.0) -> dict:
@@ -213,7 +333,7 @@ def probe_yanhe_reachable(timeout: float = 8.0) -> dict:
     }
     try:
         # 1. video token：下载前必拉
-        r = direct_get(
+        r = api_get(
             "https://cbiz.yanhekt.cn/v1/auth/video/token?id=0",
             headers=headers, timeout=(timeout, timeout * 2),
         )
@@ -237,7 +357,7 @@ def probe_yanhe_reachable(timeout: float = 8.0) -> dict:
         # 2. session list：探一个固定课程，code=0 即可（哪怕 data=[] 也算通，
         #    因为有些课程确实没视频，但 WAF 拒会让 code≠0）
         # 这里用 66554 当探针——任意已知课程 ID 都行。
-        r2 = direct_get(
+        r2 = api_get(
             "https://cbiz.yanhekt.cn/v2/course/session/list?course_id=66554",
             headers=headers, timeout=(timeout, timeout * 2),
         )
@@ -277,18 +397,21 @@ def encryptURL(url: str) -> str:
 def getSignature():
     timestamp = str(int(time.time()))
     signature = md5((magic + "_v1_" + timestamp).encode()).hexdigest()
+    # 头里的时间戳与查询参数同步刷新；否则 GUI 长时间运行后头里还是
+    # 启动时刻的旧时间戳，与新鲜签名的查询参数自相矛盾
+    headers["Xclient-Timestamp"] = timestamp
     return timestamp, signature
 
 
 def getToken() -> str:
-    req = direct_get(
+    req = api_get(
         "https://cbiz.yanhekt.cn/v1/auth/video/token?id=0", headers=headers
     )
     # Example response: `{"code":0,"message":"","data":{"token":"12345678901234ab","expired_at":1742300867,"now":1742300267}}`
     data = req.json()["data"]
     if not data:
         read_auth()
-        req = direct_get(
+        req = api_get(
             "https://cbiz.yanhekt.cn/v1/auth/video/token?id=0", headers=headers
         )
         data = req.json()["data"]
@@ -340,7 +463,7 @@ def test_auth(courseID):
     Test if the auth in headers is valid.
     Return True if the auth is valid, otherwise False.
     """
-    res = direct_get(
+    res = api_get(
         f"https://cbiz.yanhekt.cn/v2/course/session/list?course_id={courseID}",
         headers=headers,
         timeout=(10, 30),  # 连接10秒，读取30秒
@@ -351,12 +474,12 @@ def test_auth(courseID):
 def get_course_info(courseID):
     courseID = courseID.strip()
 
-    course = direct_get(
+    course = api_get(
         f"https://cbiz.yanhekt.cn/v1/course?id={courseID}&with_professor_badges=true",
         headers=headers,
         timeout=(10, 30),
     )
-    res = direct_get(
+    res = api_get(
         f"https://cbiz.yanhekt.cn/v2/course/session/list?course_id={courseID}",
         headers=headers,
         timeout=(10, 30),
@@ -386,7 +509,7 @@ def get_course_info(courseID):
 
 
 def get_audio_url(video_id):
-    res = direct_get(
+    res = api_get(
         f"https://cbiz.yanhekt.cn/v1/video?id={video_id}",
         headers=headers,
         timeout=(10, 30),

@@ -100,6 +100,37 @@ from theme import (  # noqa: E402
 )
 
 
+# ---------- 跨线程 UI 调度 ----------
+# Python 3.13+ 的 tkinter 禁止从后台线程调用 after()（直接 RuntimeError:
+# "main thread is not in main loop"），历史上所有 worker 线程都用
+# post(...) 回主线程刷界面，在新版 Python 上会静默失效。
+# 统一改为 post(fn) 投递队列，由主循环每 30ms 轮询执行（与下载页
+# progress_queue 轮询模式同构）。post 在主线程调用也安全（最多延迟一拍）。
+_ui_call_queue: "queue.Queue" = queue.Queue()
+
+
+def post(fn):
+    """线程安全地把 UI 回调投递到主线程执行（替代跨线程 post(...)）"""
+    _ui_call_queue.put(fn)
+
+
+def _drain_ui_calls(root):
+    """主线程轮询：排空 UI 回调队列并自我重新调度（勿在 worker 线程调用）"""
+    while True:
+        try:
+            fn = _ui_call_queue.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            fn()
+        except Exception:
+            logger.exception("UI 回调执行失败")
+    try:
+        root.after(30, lambda: _drain_ui_calls(root))
+    except Exception:
+        pass  # 应用退出中，停止轮询
+
+
 class DownloadTask:
     """下载任务类"""
     def __init__(self, session_info: dict, course_name: str, professor: str,
@@ -365,7 +396,7 @@ class LoginFrame(ctk.CTkFrame):
                     utils.write_auth(token)
                 elif not utils.read_auth():
                     logger.warning("没有可用的token")
-                    self.after(0, lambda: self.show_error(
+                    post(lambda: self.show_error(
                         "需要身份认证码",
                         "请先在浏览器登录延河课堂，然后获取Token：\n\n"
                         "1. 打开 https://www.yanhekt.cn 并登录\n"
@@ -373,12 +404,12 @@ class LoginFrame(ctk.CTkFrame):
                         "3. 复制弹出的认证码（32位字符）粘贴到下方输入框\n\n"
                         "提示：可以点击界面上的「复制」按钮直接复制代码"
                     ))
-                    self.after(0, lambda: self.fetch_btn.configure(state="normal"))
+                    post(lambda: self.fetch_btn.configure(state="normal"))
                     return
                 
                 # 测试认证（带超时检测）
                 logger.info("开始测试认证...")
-                self.after(0, lambda: self.status_label.configure(
+                post(lambda: self.status_label.configure(
                     text="正在验证身份...", text_color=G_WARN
                 ))
                 
@@ -391,7 +422,7 @@ class LoginFrame(ctk.CTkFrame):
                     logger.error(traceback.format_exc())
                     error_msg = str(auth_err)
                     if "ProxyError" in error_msg or "proxy" in error_msg.lower():
-                        self.after(0, lambda: self.show_error(
+                        post(lambda: self.show_error(
                             "代理/VPN 连接错误",
                             "下载器已默认绕过系统代理直连延河域名，但当前网络仍返回了代理/VPN错误。\n\n"
                             "建议：\n"
@@ -400,7 +431,7 @@ class LoginFrame(ctk.CTkFrame):
                             "3. 确保浏览器能正常访问 https://www.yanhekt.cn"
                         ))
                     elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
-                        self.after(0, lambda: self.show_error(
+                        post(lambda: self.show_error(
                             "连接超时",
                             "无法连接到延河课堂服务器。\n\n"
                             "可能原因：\n"
@@ -410,23 +441,23 @@ class LoginFrame(ctk.CTkFrame):
                             "建议：将 yanhekt.cn / cvideo.yanhekt.cn 加入直连白名单后重试"
                         ))
                     elif "SSLError" in error_msg or "certificate" in error_msg.lower():
-                        self.after(0, lambda: self.show_error(
+                        post(lambda: self.show_error(
                             "SSL证书错误",
                             "HTTPS连接失败，可能是代理软件拦截了请求。\n\n"
                             "解决方案：将延河域名加入代理/VPN 直连白名单，或临时关闭代理/VPN 后重试"
                         ))
                     else:
-                        self.after(0, lambda e=error_msg: self.show_error(
+                        post(lambda e=error_msg: self.show_error(
                             "网络连接错误",
                             f"无法连接到延河课堂：\n{e[:200]}\n\n"
                             "建议：检查网络连接；如使用 VPN/代理，请将延河域名加入直连白名单"
                         ))
-                    self.after(0, lambda: self.fetch_btn.configure(state="normal"))
+                    post(lambda: self.fetch_btn.configure(state="normal"))
                     return
 
                 if not auth_result:
                     if token:
-                        self.after(0, lambda: self.show_error(
+                        post(lambda: self.show_error(
                             "身份认证失败",
                             "Token无效或已过期。\n\n"
                             "请重新获取：\n"
@@ -436,16 +467,16 @@ class LoginFrame(ctk.CTkFrame):
                             "提示：可以点击界面上的「复制」按钮直接复制代码"
                         ))
                     else:
-                        self.after(0, lambda: self.show_error(
+                        post(lambda: self.show_error(
                             "身份认证失败",
                             "已保存的Token已过期，请重新输入认证码。"
                         ))
-                    self.after(0, lambda: self.fetch_btn.configure(state="normal"))
+                    post(lambda: self.fetch_btn.configure(state="normal"))
                     return
                 
                 # 获取课程信息
                 logger.info("开始获取课程信息...")
-                self.after(0, lambda: self.status_label.configure(
+                post(lambda: self.status_label.configure(
                     text="正在获取课程列表...", text_color=G_WARN
                 ))
                 
@@ -460,12 +491,12 @@ class LoginFrame(ctk.CTkFrame):
                 
                 if not video_list:
                     logger.warning("课程没有视频")
-                    self.after(0, lambda: self.show_error(
+                    post(lambda: self.show_error(
                         "课程无视频",
                         f"课程 {course_name} 没有可下载的视频。\n"
                         "请检查课程ID是否正确。"
                     ))
-                    self.after(0, lambda: self.fetch_btn.configure(state="normal"))
+                    post(lambda: self.fetch_btn.configure(state="normal"))
                     return
                 
                 # 成功，切换到选择界面
@@ -476,7 +507,7 @@ class LoginFrame(ctk.CTkFrame):
                         download_history.add_entry(course_id, course_name, professor)
                     except Exception as _hist_err:
                         logger.warning(f"写入下载历史失败: {_hist_err}")
-                self.after(0, lambda: self.on_login_success(
+                post(lambda: self.on_login_success(
                     course_id, video_list, course_name, professor
                 ))
                 
@@ -485,21 +516,21 @@ class LoginFrame(ctk.CTkFrame):
                 logger.error(traceback.format_exc())
                 error_msg = str(e)
                 if "ProxyError" in error_msg or "proxy" in error_msg.lower():
-                    self.after(0, lambda: self.show_error(
+                    post(lambda: self.show_error(
                         "VPN/代理错误", 
                         "下载器已默认绕过系统代理直连延河域名。\n"
                         "如果仍失败，请把 yanhekt.cn 和 cvideo.yanhekt.cn 加入代理/VPN 直连白名单，或临时关闭代理/VPN 后重试。"
                     ))
                 elif "没有视频信息" in error_msg or "课程ID" in error_msg:
-                    self.after(0, lambda e=error_msg: self.show_error(
+                    post(lambda e=error_msg: self.show_error(
                         "课程不存在", e
                     ))
                 else:
-                    self.after(0, lambda e=error_msg: self.show_error(
+                    post(lambda e=error_msg: self.show_error(
                         "获取课程失败", 
                         f"{e[:150]}\n\n常见解决方案：\n1. 检查课程ID是否正确\n2. 将延河域名加入代理/VPN直连白名单\n3. 重新获取Token"
                     ))
-                self.after(0, lambda: self.fetch_btn.configure(state="normal"))
+                post(lambda: self.fetch_btn.configure(state="normal"))
         
         thread = threading.Thread(target=do_fetch, daemon=True)
         thread.start()
@@ -550,7 +581,7 @@ class LoginFrame(ctk.CTkFrame):
         def _job():
             sys_proxy = utils._detect_system_proxy()
             probe = utils.probe_yanhe_reachable(timeout=8)
-            self.after(0, lambda: self._render_net_banner(sys_proxy, probe))
+            post(lambda: self._render_net_banner(sys_proxy, probe))
         threading.Thread(target=_job, daemon=True).start()
 
     def _render_net_banner(self, sys_proxy: dict, probe: dict):
@@ -693,15 +724,16 @@ class LoginFrame(ctk.CTkFrame):
                 # 倒计时
                 remain = d
                 while remain > 0:
-                    self.after(0, self._update_retry_countdown, i, len(delays), remain)
+                    post(lambda i=i, t=len(delays), r=remain:
+                         self._update_retry_countdown(i, t, r))
                     time.sleep(1)
                     remain -= 1
                 # 跑一次 probe
                 probe = utils.probe_yanhe_reachable(timeout=8)
                 if probe.get("ok"):
-                    self.after(0, self._on_retry_success, probe)
+                    post(lambda p=probe: self._on_retry_success(p))
                     return
-            self.after(0, self._on_retry_exhausted)
+            post(self._on_retry_exhausted)
 
         self._waf_retry_thread = threading.Thread(target=_job, daemon=True)
         self._waf_retry_thread.start()
@@ -799,13 +831,13 @@ class LoginFrame(ctk.CTkFrame):
             except Exception:
                 app_dir = None
             r = browser_auth.login_interactive(
-                on_log=lambda m: self.after(0, lambda mm=m: _log(mm)),
+                on_log=lambda m: post(lambda mm=m: _log(mm)),
                 timeout_sec=240,
                 app_dir=app_dir,
                 headless=False,
             )
             result_holder["r"] = r
-            self.after(0, _on_done)
+            post(_on_done)
 
         def _on_done():
             r = result_holder.get("r") or {}
@@ -929,10 +961,11 @@ class LoginFrame(ctk.CTkFrame):
                 msg = (f"模式={os.environ['YHKT_NET_MODE']}  HTTP={probe.get('http_status')}  "
                        f"code={probe.get('code')}  msg={probe.get('message') or probe.get('error')}")
                 color = G_SUCCESS if probe.get("ok") else G_ERROR
-                self.after(0, lambda: result_lbl.configure(text=msg, text_color=color))
+                post(lambda: result_lbl.configure(text=msg, text_color=color))
                 if probe.get("ok"):
-                    # 同时让外面 LoginFrame 横幅刷新
-                    self.after(50, self._run_network_check_async)
+                    # 同时让外面 LoginFrame 横幅刷新（本处在 worker 线程，
+                    # 延迟调度需先回主线程再 after）
+                    post(lambda: self.after(50, self._run_network_check_async))
             threading.Thread(target=_bg, daemon=True).start()
 
         ctk.CTkButton(win, text="应用并测试", height=32, command=apply_and_test).pack(
@@ -1496,8 +1529,8 @@ class DownloadFrame(ctk.CTkFrame):
                     break
                 
                 self.current_task_idx = idx
-                self.after(0, lambda i=idx: self.update_task_progress(i, 0, 0, 0))
-                self.after(0, lambda t=task: self.log(f"▶ 开始下载: {t.name}"))
+                post(lambda i=idx: self.update_task_progress(i, 0, 0, 0))
+                post(lambda t=task: self.log(f"▶ 开始下载: {t.name}"))
                 logger.info(f"开始下载任务 {idx+1}/{len(self.tasks)}: {task.name}")
                 
                 try:
@@ -1529,7 +1562,7 @@ class DownloadFrame(ctk.CTkFrame):
                     if not url:
                         # 打印可用的字段供调试
                         available_keys = list(video_info.keys())
-                        self.after(0, lambda keys=available_keys: self.log(f"⚠ 可用字段: {keys}"))
+                        post(lambda keys=available_keys: self.log(f"⚠ 可用字段: {keys}"))
                         raise Exception(f"未找到视频URL (类型: {task.download_type})，视频可能未生成")
                     
                     # 创建输出目录 (使用绝对路径)
@@ -1588,15 +1621,15 @@ class DownloadFrame(ctk.CTkFrame):
                         video_id = task.session_info['video_ids'][0]
                         audio_url = utils.get_audio_url(video_id)
                         if audio_url:
-                            self.after(0, lambda: self.log(f"下载音频: {task.name}"))
+                            post(lambda: self.log(f"下载音频: {task.name}"))
                             utils.download_audio(audio_url, path, task.name)
                     
                     completed += 1
                     task.status = "完成"
-                    self.after(0, lambda c=completed: self.overall_label.configure(
+                    post(lambda c=completed: self.overall_label.configure(
                         text=f"总进度: {c}/{len(self.tasks)}"
                     ))
-                    self.after(0, lambda c=completed: self.overall_progress.set(
+                    post(lambda c=completed: self.overall_progress.set(
                         c / len(self.tasks)
                     ))
                     
@@ -1612,15 +1645,15 @@ class DownloadFrame(ctk.CTkFrame):
                     logger.error(f"错误详情: {error_full}")
                     logger.error(f"堆栈跟踪:\n{error_traceback}")
                     
-                    self.after(0, lambda i=idx, t=task: self.update_task_progress(
+                    post(lambda i=idx, t=task: self.update_task_progress(
                         i, 0, 0, -1
                     ))
-                    self.after(0, lambda t=task, e=error_full: self.log(f"❌ 失败: {t.name}\n   原因: {e[:100]}"))
+                    post(lambda t=task, e=error_full: self.log(f"❌ 失败: {t.name}\n   原因: {e[:100]}"))
             
             # 完成
             if self.is_downloading:
-                self.after(0, lambda: self.log("所有任务完成!"))
-                self.after(0, lambda: self.stop_btn.configure(
+                post(lambda: self.log("所有任务完成!"))
+                post(lambda: self.stop_btn.configure(
                     text="返回", fg_color="green", hover_color="darkgreen",
                     command=self.on_complete
                 ))
@@ -1643,8 +1676,8 @@ class DownloadFrame(ctk.CTkFrame):
                 # 重置状态
                 task.status = "等待中"
                 task.error_msg = ""
-                self.after(0, lambda i=idx: self.update_task_progress(i, 0, 0, 0))
-                self.after(0, lambda t=task: self.log(f"开始重试: {t.name}"))
+                post(lambda i=idx: self.update_task_progress(i, 0, 0, 0))
+                post(lambda t=task: self.log(f"开始重试: {t.name}"))
                 try:
                     videos = task.session_info.get('videos', [])
                     if not videos:
@@ -1662,7 +1695,7 @@ class DownloadFrame(ctk.CTkFrame):
                             url = video_info.get('camera', '') or video_info.get('video', '')
                     if not url:
                         available_keys = list(video_info.keys())
-                        self.after(0, lambda keys=available_keys: self.log(f"可用字段: {keys}"))
+                        post(lambda keys=available_keys: self.log(f"可用字段: {keys}"))
                         raise Exception(f"未找到视频URL (类型: {task.download_type})")
                     os.makedirs(path, exist_ok=True)
                     
@@ -1712,9 +1745,9 @@ class DownloadFrame(ctk.CTkFrame):
                 except Exception as e:
                     task.status = "失败"
                     task.error_msg = str(e)[:30]
-                    self.after(0, lambda i=idx, t=task: self.update_task_progress(i, 0, 0, -1))
-                    self.after(0, lambda t=task, e=e: self.log(f"失败: {t.name} - {e}"))
-            self.after(0, lambda: self.log("重试任务完成!"))
+                    post(lambda i=idx, t=task: self.update_task_progress(i, 0, 0, -1))
+                    post(lambda t=task, e=e: self.log(f"失败: {t.name} - {e}"))
+            post(lambda: self.log("重试任务完成!"))
 
         threading.Thread(target=_redownload, daemon=True).start()
     
@@ -1749,19 +1782,21 @@ class PostProcessFrame(ctk.CTkFrame):
         )
         self.title_label.pack(side="left", padx=20)
 
-        # GPU 检测提示横幅（在创建参数控件前先决定默认设备）
-        gpu_ok, gpu_msg = self._detect_gpu()
-        banner = ctk.CTkFrame(self, fg_color=G_ACCENT if gpu_ok else G_WARN)
-        banner.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(
-            banner,
-            text=gpu_msg,
+        # GPU 检测提示横幅（检测在后台线程做：import torch 可能要数秒，
+        # 放主线程会让整个窗口冻住——这正是"打开后处理就卡"的原因之一）
+        self._gpu_ok = False
+        self.gpu_banner = ctk.CTkFrame(self, fg_color=G_PANEL)
+        self.gpu_banner.pack(fill="x", padx=20, pady=(0, 10))
+        self.gpu_banner_label = ctk.CTkLabel(
+            self.gpu_banner,
+            text="⏳ 正在检测 GPU/CUDA（后台进行，界面不会卡）...",
             font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#ffffff",
+            text_color=G_TEXT,
             anchor="w",
             justify="left",
-        ).pack(fill="x", padx=12, pady=8)
-        self._gpu_ok = gpu_ok
+        )
+        self.gpu_banner_label.pack(fill="x", padx=12, pady=8)
+        threading.Thread(target=self._detect_gpu_async, daemon=True).start()
 
         # 目录选择
         dir_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
@@ -1855,14 +1890,23 @@ class PostProcessFrame(ctk.CTkFrame):
         )
         self.compute_menu.grid(row=1, column=3, padx=10, pady=10)
 
-        # 开始按钮
+        # 开始 / 停止按钮
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(pady=10, padx=40, fill="x")
         self.start_btn = ctk.CTkButton(
-            self, text="开始处理", height=45,
+            btn_row, text="开始处理", height=45,
             font=ctk.CTkFont(size=16, weight="bold"),
             fg_color=G_ACCENT, hover_color=G_ACCENT_H,
             command=self._start_process,
         )
-        self.start_btn.pack(pady=10, padx=40, fill="x")
+        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.stop_btn = ctk.CTkButton(
+            btn_row, text="停止", width=100, height=45,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color=G_ERROR, hover_color=THEME["error_h"],
+            command=self._stop_process, state="disabled",
+        )
+        self.stop_btn.pack(side="right")
 
         # 进度条
         progress_frame = ctk.CTkFrame(self, fg_color=G_PANEL)
@@ -1911,7 +1955,35 @@ class PostProcessFrame(ctk.CTkFrame):
             "    GPU 用户：请安装 NVIDIA 驱动 + CUDA 12.x + cuDNN 9，并在此处选择 cuda/float16。"
         )
 
+    def _detect_gpu_async(self):
+        """后台线程跑 GPU 检测，结果回填横幅与默认设备/精度。"""
+        gpu_ok, gpu_msg = self._detect_gpu()
+        def apply():
+            if not self.winfo_exists():
+                return
+            self._gpu_ok = gpu_ok
+            self.gpu_banner.configure(fg_color=G_ACCENT if gpu_ok else G_WARN)
+            self.gpu_banner_label.configure(text=gpu_msg, text_color="#ffffff")
+            if gpu_ok:
+                self.device_var.set("auto")
+                self.compute_var.set("float16")
+            else:
+                self.device_var.set("cpu")
+                self.compute_var.set("int8")
+        try:
+            post(apply)
+        except RuntimeError:
+            pass  # 窗口已销毁
+
     def _log(self, msg: str):
+        # 限制日志框行数：转录一节课会产生数千段进度行，
+        # 无限累积会让 Textbox 越来越卡
+        MAX_LOG_LINES = 2000
+        try:
+            if float(self.log_text.index("end-1c").split(".")[0]) > MAX_LOG_LINES:
+                self.log_text.delete("1.0", f"{MAX_LOG_LINES // 4}.0")
+        except Exception:
+            pass
         ts = time.strftime("%H:%M:%S")
         self.log_text.insert("end", f"[{ts}] {msg}\n")
         self.log_text.see("end")
@@ -1928,7 +2000,9 @@ class PostProcessFrame(ctk.CTkFrame):
             return
 
         self.is_processing = True
+        self._stop_event = threading.Event()
         self.start_btn.configure(state="disabled", text="处理中...")
+        self.stop_btn.configure(state="normal")
         self.back_btn.configure(state="disabled")
         self._log("开始处理...")
 
@@ -1936,10 +2010,21 @@ class PostProcessFrame(ctk.CTkFrame):
             try:
                 import batch_process
 
+                # 进度回调节流：转写器每个语音段都会调一次回调，
+                # 一节课数千段 × 3 个 after() 会把主线程淹没（GUI 卡顿主因）。
+                # 改为最快 150ms 一次；日志最快 2s 一条。
+                last_ui = [0.0]
+                last_log = [0.0]
+
                 def gui_progress(current, total, msg):
-                    self.after(0, lambda: self.progress_bar.set(current / total if total > 0 else 0))
-                    self.after(0, lambda m=msg: self.progress_label.configure(text=m))
-                    self.after(0, lambda m=msg: self._log(m))
+                    now = time.monotonic()
+                    if now - last_ui[0] >= 0.15:
+                        last_ui[0] = now
+                        post(lambda: self.progress_bar.set(current / total if total > 0 else 0))
+                        post(lambda m=msg: self.progress_label.configure(text=m))
+                        if now - last_log[0] >= 2.0:
+                            last_log[0] = now
+                            post(lambda m=msg: self._log(m))
 
                 results = batch_process.batch_process_all(
                     input_dir,
@@ -1950,6 +2035,7 @@ class PostProcessFrame(ctk.CTkFrame):
                     compute_type=self.compute_var.get(),
                     language=self.lang_var.get(),
                     progress_callback=gui_progress,
+                    stop_event=self._stop_event,
                 )
 
                 # 汇总
@@ -1959,27 +2045,37 @@ class PostProcessFrame(ctk.CTkFrame):
                 trans_ok = sum(1 for r in transcript_results if "成功" in r.get("status", ""))
 
                 summary = f"处理完成! 课件: {slide_ok}/{len(slide_results)}, 转录: {trans_ok}/{len(transcript_results)}"
-                self.after(0, lambda: self._log(f"✅ {summary}"))
-                self.after(0, lambda: self.progress_label.configure(text=summary))
-                self.after(0, lambda: self.progress_bar.set(1))
+                if getattr(self, "_stop_event", None) and self._stop_event.is_set():
+                    summary = f"已手动停止。已完成 — {summary}"
+                post(lambda: self._log(f"✅ {summary}"))
+                post(lambda: self.progress_label.configure(text=summary))
+                post(lambda: self.progress_bar.set(1))
 
             except ImportError as e:
-                self.after(0, lambda e=e: self._log(f"❌ 模块导入失败: {e}"))
-                self.after(0, lambda e=e: messagebox.showerror(
+                post(lambda e=e: self._log(f"❌ 模块导入失败: {e}"))
+                post(lambda e=e: messagebox.showerror(
                     "依赖缺失",
                     f"缺少必要的库: {e}\n\n"
                     "请在 GPU 环境中安装:\n"
                     "pip install faster-whisper tqdm imagehash python-pptx"
                 ))
             except Exception as e:
-                self.after(0, lambda e=e: self._log(f"❌ 处理失败: {e}"))
-                self.after(0, lambda e=e: messagebox.showerror("处理失败", str(e)[:300]))
+                post(lambda e=e: self._log(f"❌ 处理失败: {e}"))
+                post(lambda e=e: messagebox.showerror("处理失败", str(e)[:300]))
             finally:
-                self.after(0, lambda: self.start_btn.configure(state="normal", text="开始处理"))
-                self.after(0, lambda: self.back_btn.configure(state="normal"))
+                post(lambda: self.start_btn.configure(state="normal", text="开始处理"))
+                post(lambda: self.stop_btn.configure(state="disabled"))
+                post(lambda: self.back_btn.configure(state="normal"))
                 self.is_processing = False
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_process(self):
+        """请求停止后处理。当前视频处理完后即停（不杀线程，安全退出）。"""
+        if getattr(self, "_stop_event", None) and not self._stop_event.is_set():
+            self._stop_event.set()
+            self._log("⏹ 已请求停止，当前视频处理完后即停止...")
+            self.stop_btn.configure(state="disabled")
 
 
 class YanheDownloaderApp(ctk.CTk):
@@ -2003,7 +2099,10 @@ class YanheDownloaderApp(ctk.CTk):
             logger.warning(f"设置窗口图标失败: {e}")
 
         self.configure(fg_color=G_BG)
-        
+
+        # 启动跨线程 UI 调度轮询器（worker 线程通过 post() 投递的回调在此执行）
+        self.after(30, lambda: _drain_ui_calls(self))
+
         # 居中显示
         self.center_window()
         

@@ -266,6 +266,8 @@ class M3u8Download:
                 verify=False, headers=self._headers,
             ) as res:
                 if res.status_code != 200:
+                    # 403/429/503 由 utils.direct_get 自动触发全局熔断，
+                    # 其余线程会统一退避，避免继续硬敲导致封禁升级
                     raise Exception(f"Status {res.status_code}")
                 dir_path = os.path.dirname(name)
                 if not os.path.exists(dir_path):

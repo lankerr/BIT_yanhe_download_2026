@@ -55,15 +55,19 @@ def detect_scenes_ffmpeg(video_path: str, threshold: float = SCENE_THRESHOLD) ->
     """
     使用FFmpeg scene filter检测场景变化时间点
     返回场景变化的时间戳列表（秒）
+
+    注：曾试过在 select 前加 scale=640 预缩放降打分开销，实测
+    （ffmpeg 8 / 1080p，-benchmark）CPU 反而多耗约 50%——scene 打分
+    本身已全分辨率 SIMD 优化，加 scale 等于多处理一遍帧，故不加。
     """
     duration = get_video_duration(video_path)
     duration_str = f"{int(duration//60)}分{int(duration%60)}秒" if duration > 0 else "未知"
-    
+
     cmd = [
         ffmpeg_path(), '-hide_banner',
         '-i', video_path,
         '-vf', f"select='gt(scene,{threshold})',showinfo",
-        '-an', '-f', 'null', '-'
+        '-an', '-sn', '-dn', '-f', 'null', '-'
     ]
     
     print(f"正在使用 FFmpeg 分析场景变化 (threshold={threshold})...")
@@ -164,25 +168,31 @@ def extract_frame_at_time(video_path: str, timestamp: float) -> Optional[np.ndar
 
 
 def extract_frames_batch(video_path: str, timestamps: List[float]) -> List[Tuple[float, np.ndarray]]:
-    """批量提取帧（使用OpenCV）"""
+    """批量提取帧（使用OpenCV，按时间点 seek）"""
     if not timestamps:
         return []
-    
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"无法打开视频: {video_path}")
         return []
-    
+
     fps = cap.get(cv2.CAP_PROP_FPS)
+    # 某些封装的 fps 会返回 0/NaN，此时按帧号定位会把所有帧都读到 0 位置，
+    # 导致全部拿到同一帧——退回按毫秒定位
+    fps_valid = fps and fps > 0 and fps == fps  # 排除 NaN
     frames = []
-    
-    for timestamp in tqdm(timestamps, desc="提取帧", unit="帧"):
-        frame_num = int(timestamp * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+
+    for timestamp in tqdm(sorted(timestamps), desc="提取帧", unit="帧"):
+        if fps_valid:
+            frame_num = int(timestamp * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        else:
+            cap.set(cv2.CAP_PROP_POS_MSEC, int(timestamp * 1000))
         ret, frame = cap.read()
         if ret:
             frames.append((timestamp, frame))
-    
+
     cap.release()
     return frames
 

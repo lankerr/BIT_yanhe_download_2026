@@ -17,6 +17,18 @@ from typing import Optional, Callable, List, Tuple
 if not os.environ.get("HF_ENDPOINT"):
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+# hf-mirror 必须绕过系统代理：实测挂代理时 hf-mirror 会 308 重定向回
+# huggingface.co（本机不可达），导致 FileMetadataError。注意 requests 不认
+# NO_PROXY="*"（那是 curl 语法），必须写具体域名。
+_HF_NO_PROXY = "hf-mirror.com,huggingface.co,cdn-lfs.hf-mirror.com,localhost,127.0.0.1"
+if os.environ.get("NO_PROXY"):
+    os.environ["NO_PROXY"] += "," + _HF_NO_PROXY
+    os.environ["no_proxy"] = os.environ["NO_PROXY"]
+else:
+    os.environ["NO_PROXY"] = os.environ["no_proxy"] = _HF_NO_PROXY
+# hf-mirror 不代理 Xet 存储，禁用避免新版 huggingface_hub 走 Xet 下载失败
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 try:
     from app_paths import ffmpeg_path, ffprobe_path
 except ImportError:
@@ -126,7 +138,10 @@ def extract_audio_from_video(video_path: str, output_audio: str = None,
     ]
 
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
         pbar = None
         if HAS_TQDM and duration > 0:
             pbar = tqdm(total=int(duration), unit="s", desc="提取音频",
@@ -147,13 +162,20 @@ def extract_audio_from_video(video_path: str, output_audio: str = None,
         if pbar:
             pbar.update(int(duration) - last_pos)
             pbar.close()
+        # 读出 stderr 再 wait（loglevel error 下输出很小，不会撑爆管道），
+        # 否则真实报错（如"无音轨"）永远看不到
+        stderr_out = proc.stderr.read() if proc.stderr else ""
         proc.wait(timeout=600)
         if proc.returncode != 0:
-            raise subprocess.CalledProcessError(proc.returncode, cmd)
+            msg = stderr_out.strip()
+            if "does not contain any stream" in msg or "Output file" in msg and "stream" in msg:
+                raise RuntimeError("视频没有音轨，无法转录（该视频可能是纯画面录制）")
+            raise RuntimeError(f"FFmpeg 提取音频失败 (exit={proc.returncode}): {msg[:400] or '未知错误'}")
         print(f"音频提取完成: {output_audio}")
         return output_audio
-    except subprocess.CalledProcessError as e:
-        print(f"音频提取失败: {e.stderr.decode('utf-8', errors='replace')}")
+    except RuntimeError:
+        raise
+    except Exception as e:
         raise RuntimeError(f"FFmpeg 提取音频失败: {e}")
 
 
@@ -206,6 +228,7 @@ class AudioTranscriber:
         language: str = DEFAULT_LANGUAGE,
         beam_size: int = DEFAULT_BEAM_SIZE,
         vad_filter: bool = DEFAULT_VAD_FILTER,
+        batch_size: int = 0,
     ):
         if not HAS_WHISPER:
             raise ImportError(
@@ -219,7 +242,9 @@ class AudioTranscriber:
         self.language = language
         self.beam_size = beam_size
         self.vad_filter = vad_filter
+        self.batch_size = batch_size  # 0 = 按设备自动选择
         self.model = None
+        self.batched_model = None  # BatchedInferencePipeline（可用时启用，GPU 典型 4x 提速）
 
     def load_model(self, progress_callback: Optional[Callable] = None):
         """加载 Whisper 模型"""
@@ -233,16 +258,56 @@ class AudioTranscriber:
             progress_callback(0, 100, "正在加载模型...")
 
         start = time.time()
-        self.model = WhisperModel(
-            self.model_size,
-            device=self.device,
-            compute_type=self.compute_type,
-        )
+        # CPU 上显式给满线程数，否则 ctranslate2 默认只用 4 线程，int8 会慢很多
+        cpu_threads = os.cpu_count() or 4
+        try:
+            self.model = WhisperModel(
+                self.model_size,
+                device=self.device,
+                compute_type=self.compute_type,
+                cpu_threads=cpu_threads,
+            )
+        except Exception as e:
+            # 常见坑：系统挂着死代理（如 Clash 已退出但注册表代理仍在）时，
+            # huggingface_hub 下载模型会 ConnectionError/LocalEntryNotFoundError。
+            # 与下载引擎同样的策略：强制直连重试一次。
+            if self.model is None and ("connection" in str(e).lower() or "localentry" in type(e).__name__.lower()
+                                       or "proxy" in str(e).lower() or "offline" in str(e).lower()
+                                       or "metadata" in str(e).lower()):
+                print(f"⚠ 模型下载失败（可能被系统代理拦截），强制直连重试: {type(e).__name__}")
+                os.environ["NO_PROXY"] = os.environ["no_proxy"] = _HF_NO_PROXY
+                self.model = WhisperModel(
+                    self.model_size,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    cpu_threads=cpu_threads,
+                )
+            else:
+                raise
+
+        # 尝试启用批量推理管线（faster-whisper >= 1.0）
+        # GPU 上典型提速 3-4x；失败则静默回退经典逐段推理
+        try:
+            from faster_whisper import BatchedInferencePipeline
+            self.batched_model = BatchedInferencePipeline(model=self.model)
+            print("已启用 Batched 批量推理管线 (GPU 典型提速 3-4x)")
+        except ImportError:
+            self.batched_model = None
+            print("faster-whisper 版本较旧，无 BatchedInferencePipeline，使用经典逐段推理")
+
         elapsed = time.time() - start
         print(f"模型加载完成 ({elapsed:.1f}秒)")
 
         if progress_callback:
             progress_callback(100, 100, "模型加载完成")
+
+    def _effective_batch_size(self) -> int:
+        if self.batch_size and self.batch_size > 0:
+            return self.batch_size
+        # 自动：GPU 用 16（large-v3 float16 约需 3-4GB 显存），CPU 用 8
+        # 注意设备在底层 ctranslate2 模型上（faster-whisper 1.2 的 WhisperModel 无 .device）
+        dev = str(getattr(getattr(self.model, "model", None), "device", "cpu")).lower()
+        return 16 if "cuda" in dev else 8
 
     def transcribe_file(
         self,
@@ -322,10 +387,9 @@ class AudioTranscriber:
             pbar = tqdm(total=int(duration), unit="s", desc="转录中",
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}, {rate_fmt}]")
 
-        def consume_transcription(source_path: str, offset: float = 0.0) -> None:
-            nonlocal detected_lang, lang_prob, last_pos
-            segments_iter, info = self.model.transcribe(
-                source_path,
+        def _run_engine(source_path: str, offset: float):
+            """按可用引擎执行一次转写；批量管线 OOM 时自动降级经典管线重跑。"""
+            common = dict(
                 language=self.language,
                 beam_size=self.beam_size,
                 vad_filter=self.vad_filter,
@@ -335,6 +399,23 @@ class AudioTranscriber:
                 ),
                 condition_on_previous_text=False,
             )
+            if self.batched_model is not None:
+                try:
+                    return self.batched_model.transcribe(
+                        source_path, batch_size=self._effective_batch_size(), **common,
+                    )
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "out of memory" in msg or "cuda" in msg or "allocat" in msg:
+                        print(f"⚠ 批量推理显存不足，降级为经典逐段推理: {e}")
+                        self.batched_model = None
+                    else:
+                        raise
+            return self.model.transcribe(source_path, **common)
+
+        def consume_transcription(source_path: str, offset: float = 0.0) -> None:
+            nonlocal detected_lang, lang_prob, last_pos
+            segments_iter, info = _run_engine(source_path, offset)
             detected_lang = info.language
             lang_prob = info.language_probability
 
@@ -604,6 +685,8 @@ def main():
         help=f"计算类型 (float16/int8/float32，默认: {DEFAULT_COMPUTE_TYPE})"
     )
     parser.add_argument("--batch", action="store_true", help="批量模式：递归处理目录中的所有文件")
+    parser.add_argument("--batch-size", type=int, default=0,
+                        help="Batched 批量推理的 batch size（0=自动：GPU 16 / CPU 8）")
     parser.add_argument("--no-txt", action="store_true", help="不输出 TXT 文件")
     parser.add_argument("--no-srt", action="store_true", help="不输出 SRT 文件")
     parser.add_argument("--no-vad", action="store_true", help="不使用 VAD 过滤")
@@ -641,6 +724,7 @@ def main():
             compute_type=args.compute_type,
             language=args.language,
             vad_filter=not args.no_vad,
+            batch_size=args.batch_size,
         )
         result = transcriber.transcribe_file(
             args.input,

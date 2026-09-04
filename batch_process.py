@@ -106,9 +106,12 @@ def batch_extract_slides(
     min_interval: float = 2.0,
     similarity_threshold: float = 0.90,
     progress_callback: Optional[Callable] = None,
+    stop_event=None,
 ) -> List[dict]:
     """
     批量提取课件幻灯片
+
+    stop_event: threading.Event，置位后当前视频处理完即停止整个批次
     """
     import ppt_extractor_gpu as extractor
 
@@ -130,6 +133,9 @@ def batch_extract_slides(
     total_slides = 0
 
     for i, video_path in enumerate(mp4_files):
+        if stop_event is not None and stop_event.is_set():
+            print(f"⏹ 收到停止请求，课件提取在第 {i + 1}/{len(mp4_files)} 个视频前停止")
+            break
         video_name = Path(video_path).stem
         slide_dir = os.path.join(output_dir, video_name)
         pptx_path = os.path.join(output_dir, f"{video_name}.pptx")
@@ -192,9 +198,12 @@ def batch_transcribe_videos(
     compute_type: str = "float16",
     language: str = "zh",
     progress_callback: Optional[Callable] = None,
+    stop_event=None,
 ) -> List[dict]:
     """
     批量转录视频音频
+
+    stop_event: threading.Event，置位后当前视频转写完即停止整个批次
     """
     import audio_transcriber_gpu as transcriber_mod
 
@@ -216,6 +225,9 @@ def batch_transcribe_videos(
     transcriber = None
     results = []
     for i, video_path in enumerate(mp4_files):
+        if stop_event is not None and stop_event.is_set():
+            print(f"⏹ 收到停止请求，音频转录在第 {i + 1}/{len(mp4_files)} 个视频前停止")
+            break
         video_name = Path(video_path).stem
         file_output_dir = os.path.join(output_dir, video_name)
 
@@ -278,6 +290,7 @@ def batch_process_all(
     compute_type: str = "float16",
     language: str = "zh",
     progress_callback: Optional[Callable] = None,
+    stop_event=None,
 ) -> dict:
     """
     统一批处理：课件提取 + 音频转录
@@ -289,18 +302,21 @@ def batch_process_all(
         print("阶段 1: 课件提取")
         print("=" * 60)
         all_results["slides"] = batch_extract_slides(
-            input_dir, progress_callback=progress_callback,
+            input_dir, progress_callback=progress_callback, stop_event=stop_event,
         )
 
     if do_transcribe:
-        print("\n" + "=" * 60)
-        print("阶段 2: 音频转录")
-        print("=" * 60)
-        all_results["transcripts"] = batch_transcribe_videos(
-            input_dir, model_size=model_size, device=device,
-            compute_type=compute_type, language=language,
-            progress_callback=progress_callback,
-        )
+        if stop_event is not None and stop_event.is_set():
+            print("\n⏹ 已停止，跳过音频转录阶段")
+        else:
+            print("\n" + "=" * 60)
+            print("阶段 2: 音频转录")
+            print("=" * 60)
+            all_results["transcripts"] = batch_transcribe_videos(
+                input_dir, model_size=model_size, device=device,
+                compute_type=compute_type, language=language,
+                progress_callback=progress_callback, stop_event=stop_event,
+            )
 
     return all_results
 
