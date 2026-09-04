@@ -54,6 +54,11 @@ _request_local = threading.local()
 #   "system" ：完全跟随系统/环境变量代理（trust_env=True）。给那些**只能**靠
 #               代理才能直连延河的用户用（比如校外节点正好是延河允许 IP 段）。
 #   "proxy=<url>" ：显式走给定代理，例：YHKT_NET_MODE=proxy=http://127.0.0.1:7890
+#   "ip=<IPv4>"  ：把延河域名直接重定向到指定校内服务器 IP（Host 头仍是原域名）。
+#               这是竞品标称 110MB/s 的同款原理：通过 ping cbiz.yanhekt.cn 等
+#               拿到校内解析 IP 后填入，如 YHKT_NET_MODE=ip=10.x.x.x。
+#               注意：IP 直连时证书必然对不上 IP，此模式会关闭证书校验
+#               （verify=False，与延河 CDN 请求的一贯做法一致）。
 NET_MODE_DEFAULT = "auto"
 
 # 延河相关域名，会用于 direct 模式 DNS 自解析与 GUI 检测白名单建议
@@ -176,6 +181,31 @@ class _IPDirectAdapter(requests.adapters.HTTPAdapter):
         return super().send(request, **kw)
 
 
+class _HostOverrideAdapter(requests.adapters.HTTPAdapter):
+    """把请求 URL 的 netloc 替换为指定 IP，Host 头保留原域名。
+
+    用途：ip=<IPv4> 模式（竞品 110MB/s 同款原理）。把延河域名"重定向"到
+    校内服务器 IP 直连——服务器按 Host 头 + SNI 识别原站点，路径/参数不变。
+    注意：证书是对域名签发的，直连 IP 时校验必然失败，所以 ip= 模式下
+    session 需 verify=False（与延河 CDN 请求的一贯做法一致）。
+    """
+
+    def __init__(self, ip: str, **kw):
+        self._ip = ip
+        super().__init__(**kw)
+
+    def send(self, request, **kw):  # type: ignore[override]
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(request.url)
+        # 保留 scheme/path/query，只把 netloc（host[:port]）换成目标 IP
+        request.url = urlunsplit(
+            (parts.scheme, self._ip, parts.path, parts.query, parts.fragment)
+        )
+        # Host 头仍写原域名，让服务端按域名路由/识别站点
+        request.headers["Host"] = parts.netloc
+        return super().send(request, **kw)
+
+
 def _detect_system_proxy() -> dict:
     """读 Windows 注册表，看 HKCU\\...\\Internet Settings 的 ProxyEnable。"""
     info = {"enabled": False, "server": "", "source": "none"}
@@ -219,6 +249,14 @@ def _make_session(mode: str) -> requests.Session:
     if mode.startswith("proxy="):
         url = mode.split("=", 1)[1]
         s.proxies = {"http": url, "https": url}
+        return s
+    if mode.startswith("ip="):
+        ip = mode.split("=", 1)[1].strip()
+        # IP 直连时证书是对域名签发的，校验必然对不上 IP → 关闭校验。
+        # 已知取舍：与延河 CDN 请求本来就 verify=False 的风格一致。
+        s.verify = False
+        for host in YHKT_HOSTS:
+            s.mount(f"https://{host}", _HostOverrideAdapter(ip))
         return s
     # auto / direct：强制空代理串（比 trust_env=False 更显式）
     s.proxies = {"http": "", "https": ""}

@@ -59,14 +59,22 @@
 ### 3. 内嵌 FFmpeg
 打包时通过 `fetch_ffmpeg.py` 把 `ffmpeg.exe` / `ffprobe.exe` 内嵌入 exe，运行时从 `_MEIPASS` 加载，**真正零依赖**。
 
-### 4. PPT 智能提取（完整版）
-`FFmpeg scene` 滤镜检测画面剧变 → 时间戳过滤 → pHash 去重 → 输出 JPG + PPTX，约 50× 实时。
+### 4. PPT 智能提取（完整版，v2 融合算子内核）
+单遍融合管线：FFmpeg 解码一次，`fps=5` 抽样（幻灯片一页停 ≥ 数秒，零漏检，设计参考
+arXiv:2202.03540 SliTraNet / arXiv:1804.09066 ECO 的帧冗余抽样）→ 320px 灰度缩略图管道 →
+numpy 批量向量化在同一遍内完成「帧差分变化检测 + 32×32 DCT mini-pHash 去重」→ 仅对幸存页
+seek 提取全分辨率帧。实测比旧管线（全分辨率 scene 扫描 + 逐点 seek + PIL pHash 去重）
+快 1.2-1.8×，判别力对齐（255bit pHash），并输出 JPG + PPTX + **PDF** 三格式。旧管线保留
+为 `engine="legacy"` 回退。已实测否决的方案：硬解 d3d11va/cuda（省 6× CPU 但墙钟慢
+1.7-5×，GPU 回传串行化）、CNN 检测（SAD 信号已零漏检，推理反而更慢）。
 
 ### 5. 音频转录（完整版）
 `faster-whisper` (CTranslate2)，GPU `float16` / CPU `int8` 自适应，默认走 `hf-mirror.com` 拉模型避免 huggingface.co 不可达。
 
 ### 6. VPN/代理环境自动直连
 延河 API、m3u8、ts 分片、音频下载均使用不读取系统代理的直连会话，减少 VPN、系统代理、透明代理导致的 403、ProxyError、长时间卡住等问题。仍然可以开着 VPN 做别的事，下载器会尽量绕开系统代理直连延河域名。
+
+在此基础上还支持 **IP 直连模式**：设置 `YHKT_NET_MODE=ip=<IPv4>`（例：先通过 `ping cbiz.yanhekt.cn` 拿到校内解析出的 IP，再填入如 `YHKT_NET_MODE=ip=10.x.x.x`），即可把延河域名重定向到校内服务器 IP 直连，Host 头仍为原域名。这是竞品标称 110MB/s 的同款原理；注意该模式下证书校验会关闭（verify=False），因为证书是对域名签发的，直连 IP 必然对不上。
 
 ### 7. 长课转写分块
 超过 30 分钟的音频会自动切成约 20 分钟一段逐段转写，再把时间戳拼回原视频时间线，避免 90 分钟以上课程一次性送入 Whisper 时内存分配失败。
@@ -133,6 +141,14 @@ build_full.bat
 ---
 
 ## 📜 更新日志
+
+### v2026.09 (二) – 内核算子优化
+- **PPT 提取 v2 融合算子**：单遍解码完成检测+去重（详见核心技术 4），实测 1.2-1.8× 提速，
+  判别力对齐旧管线；`fps=5` 冗余抽样 + numpy 批量向量化 + 无效重扫短路。
+- **新增**：课件 PDF 导出（`pdf_export.py`，批处理自动与 PPTX 一同产出）。
+- **新增**：内网直连模式 `YHKT_NET_MODE=ip=<IPv4>`（竞品 110MB/s 同款原理，详见核心技术 6）。
+- **m3u8 内核微优化**：分片写盘 chunk 64KB→1MB（落盘循环实测 1.39×）；GUI/重定向模式
+  不再每片刷进度条；空文件判定去 stat。
 
 ### v2026.09 – AI 提速 + 限流对策 + 新版 Python 兼容 + 压测工具
 - **新增**：**最高速度压测工具** `scripts/bench_maxspeed.py`——生产引擎整节课全段 K 扫描

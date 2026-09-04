@@ -256,6 +256,8 @@ class M3u8Download:
         sig_thread.start()
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+            # 提交循环确认：name 逐片依赖序号 k，os.path.join 无法再外提；
+            # self._file_path 已是构造时算好的绝对路径，循环内无重复计算
             futures = []
             for k, ts_url in enumerate(self._ts_url_list):
                 name = os.path.join(self._file_path, f"{k}.ts")
@@ -337,7 +339,13 @@ class M3u8Download:
                 if not os.path.exists(dir_path):
                     os.makedirs(dir_path, exist_ok=True)
                 with open(name, "wb") as ts:
-                    for chunk in res.iter_content(chunk_size=64 * 1024):
+                    # 算子级优化：chunk 64KB -> 1MB。每片约 1.8MB，64KB 要循环约
+                    # 29 次（含 29 次 Python 层调度 + write 系统调用 + 超时检查），
+                    # 1MB 只需 2 次；iter_content 是"最多 chunk_size"，分片尾部
+                    # 不足 1MB 时自动返回剩余部分，落盘内容字节级等价。
+                    # 总超时检查粒度从"每 64KB"变为"每 1MB"，1MB@百兆宽带约 0.1s，
+                    # 对 120s 总超时的判定精度影响可忽略。
+                    for chunk in res.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             ts.write(chunk)
                             _received += len(chunk)
@@ -346,7 +354,10 @@ class M3u8Download:
                                 f"Total timeout {self._total_timeout}s for "
                                 f"{os.path.basename(name)}"
                             )
-            if os.path.getsize(name) == 0:
+            # 算子级优化：不再 os.path.getsize() 重新 stat 读文件元数据，
+            # 直接用本地累计的写入字节数判断空文件，语义等价（文件刚由
+            # 本线程写完关闭，字节数即 _received）
+            if _received == 0:
                 raise Exception("Downloaded file is empty")
             with self._bytes_lock:
                 self._bytes_done += _received
@@ -363,6 +374,12 @@ class M3u8Download:
 
     def _render_progress_bar(self):
         """终端进度条（GUI 模式下无副作用）。"""
+        # 算子级优化：GUI 模式 / 输出被重定向（非 tty）时进度条无人观看，
+        # 直接 return，避免每个分片成功都白写一次 stdout（297 片 = 297 次
+        # write+flush 系统调用）。PyInstaller --noconsole 下 sys.stdout 可能为
+        # None，先防御 None 再调 isatty()。
+        if self._gui_mode or sys.stdout is None or not sys.stdout.isatty():
+            return
         if self._ts_sum <= 0:
             return
         done = self._success_sum
@@ -373,6 +390,8 @@ class M3u8Download:
         sys.stdout.flush()
 
     def watchdog(self):
+        # GUI 模式开销评估：每 5s 醒一次只做 time.time() 比较，几乎零开销，
+        # 是"真僵死"兜底所必需，保持原样
         while self._downloading:
             time.sleep(5)
             idle = time.time() - self._last_activity_time
@@ -394,6 +413,9 @@ class M3u8Download:
                 return
 
     def updateSignatureLoop(self):
+        # GUI 模式开销评估：每 10s 一次 utils.getSignature()（一次轻量 HTTP），
+        # 相对 16 线程的分片流量可忽略，且签名过期会导致 ts 请求 403，
+        # 不能安全省略，保持原样
         while self._success_sum != self._ts_sum and self._downloading:
             self.timestamp, self.signature = utils.getSignature()
             time.sleep(10)

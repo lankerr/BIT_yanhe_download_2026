@@ -163,6 +163,12 @@ def batch_extract_slides(
             )
             if count > 0:
                 extractor.create_pptx(slide_dir, pptx_path)
+                # 同步导出 PDF (pptx 路径后缀换成 .pdf), 失败不影响主流程
+                try:
+                    import pdf_export
+                    pdf_export.create_pdf(slide_dir, str(Path(pptx_path).with_suffix('.pdf')))
+                except Exception as e:
+                    print(f"PDF 导出失败(不影响PPT): {e}")
                 total_slides += count
                 status = f"成功({count}张)"
             else:
