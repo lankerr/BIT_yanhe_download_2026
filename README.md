@@ -126,14 +126,22 @@ build_full.bat
 ├── build_simple.bat
 ├── build_full.bat
 ├── requirements.txt
-└── scripts/legacy/            # 历史/实验脚本（不参与打包）
+├── scripts/bench_maxspeed.py     # 最高速度压测（K扫描+自动报告，--mock 可自检）
+└── scripts/legacy/               # 历史/实验脚本（不参与打包）
 ```
 
 ---
 
 ## 📜 更新日志
 
-### v2026.09 – AI 提速 + 限流对策 + 新版 Python 兼容
+### v2026.09 – AI 提速 + 限流对策 + 新版 Python 兼容 + 压测工具
+- **新增**：**最高速度压测工具** `scripts/bench_maxspeed.py`——生产引擎整节课全段 K 扫描
+  （4..64 任意档位、多轮交错抗网络漂移），引擎内置字节级仪表（0.5s 采样），自动产出
+  交付级 `report.md` + 吞吐曲线图 + CSV/JSON；`--mock` 本地模拟 CDN 自检无需 token。
+  操作手册见 `docs/maxspeed_runbook.md`。
+- **新增**：引擎观测仪表（`stats()` / `final_stats()` / `stats_hook`）：字节计数、单段
+  耗时 p50-p99、阶段2重试、缺片计数，纯增量不影响下载行为；限流熔断器新增累计触发
+  次数与累计退避时长统计。引擎并发上限 32 → 64（仅压测探索用，GUI 滑块维持默认 16）。
 - **修复**：补提交缺失的 `theme.py`（此前 `gui_app.py` import 即崩，仓库 main 无法启动）。
 - **AI 提速**：Whisper 启用 `BatchedInferencePipeline` 批量推理（本机 RTX 5070 实测
   **12.7x**：120s 音频 16.9s → 1.3s），CPU 显式给满线程数，批量管线 OOM 自动降级经典管线。

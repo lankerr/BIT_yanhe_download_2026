@@ -87,6 +87,9 @@ class WafBreaker:
         self._base = base_cooldown
         self._max = max_cooldown
         self.last_reason = ""
+        # 压测观测计数（bench_maxspeed 报表用，不影响行为）
+        self.trip_count = 0         # 累计触发次数
+        self.total_cooldown_s = 0.0 # 累计冷却秒数（限流造成的时间损失）
 
     def trip(self, reason: str) -> float:
         """触发熔断；返回本次冷却秒数。幂等：冷却期内重复触发只升级。"""
@@ -95,6 +98,8 @@ class WafBreaker:
             cooldown = min(self._base * (2 ** (self._level - 1)), self._max)
             self._until = time.time() + cooldown
             self.last_reason = reason
+            self.trip_count += 1
+            self.total_cooldown_s += cooldown
         print(f"[限流熔断] {reason} → 全局冷却 {cooldown:.0f}s（第 {self._level} 次连续触发）")
         return cooldown
 

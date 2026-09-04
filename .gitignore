@@ -84,7 +84,7 @@ refs/
 
 # ---- benchmark 与 E2E 跑批产物 ----
 runs/
-bench/results/
+bench/
 runs_e2e_*.log
 
 # ---- 浏览器登录持久化 ----

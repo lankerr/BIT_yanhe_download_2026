@@ -52,9 +52,11 @@ class M3u8Download:
 
     :param url: 完整的 m3u8 文件链接
     :param name: 保存的文件名
-    :param max_workers: 固定并发线程数（钳制到 4..32）
+    :param max_workers: 固定并发线程数（钳制到 4..64）
     :param num_retries: m3u8 信息获取重试次数
     :param base64_key: base64 编码的解密 key（可选）
+    :param stats_hook: 可选回调 stats_hook(engine)，在并发下载启动前被调用，
+                       供压测脚本拿到引擎引用做字节级采样（GUI 不用传）
     """
 
     def __init__(
@@ -67,13 +69,15 @@ class M3u8Download:
         base64_key=None,
         progress_callback=dummy_func,
         gui_mode=False,
+        stats_hook=None,
     ):
         self._url = url
         self._token = None
         self._workDir = workDir
         self._name = name
-        # 固定并发：延河 CDN 单连接吞吐低，饱和点 K≈8-16，超过反而争用。
-        self._max_workers = max(4, min(max_workers, 32))
+        # 固定并发：家用宽带实测饱和点 K≈8-16；上限放到 64 供校园网压测
+        # 探索更高档位（GUI 滑块仍维持默认 16、上限 32）。
+        self._max_workers = max(4, min(max_workers, 64))
         self._num_retries = num_retries
         self._progress_callback = progress_callback
 
@@ -107,6 +111,16 @@ class M3u8Download:
         # 计数加锁：消除“卡 99%”死循环
         self._success_lock = threading.Lock()
         self._permanently_failed = set()  # 永久失败的文件
+
+        # ---- 压测观测仪表（bench_maxspeed 采样用，不影响下载行为）----
+        self._bytes_done = 0            # 成功分片累计字节数
+        self._bytes_lock = threading.Lock()
+        self._seg_times = []            # 每片成功耗时(s)，list.append 原子免锁
+        self._deferred_count = 0        # 阶段1失败进补下载队列的分片数
+        self._stage2_attempts = 0       # 阶段2重试总次数
+        self._stage2_ok = 0             # 阶段2补回的分片数
+        self._t_download_start = None   # 并发下载阶段起点
+        self._stats_hook = stats_hook
 
         self._watchdog_thread = threading.Thread(target=self.watchdog, daemon=True)
         self._watchdog_thread.start()
@@ -174,6 +188,43 @@ class M3u8Download:
         self._downloading = False
 
     # ------------------------------------------------------------
+    # 压测观测
+    # ------------------------------------------------------------
+    def stats(self) -> dict:
+        """采样快照（线程安全），压测脚本每 0.5s 轮询一次。"""
+        with self._bytes_lock:
+            b = self._bytes_done
+        return {
+            "bytes": b,
+            "success": self._success_sum,
+            "total": self._ts_sum,
+            "seg_done": len(self._seg_times),
+            "download_elapsed": (
+                time.time() - self._t_download_start
+                if self._t_download_start else None
+            ),
+        }
+
+    def final_stats(self) -> dict:
+        """下载结束后的完整统计（含分片耗时分布）。"""
+        times = sorted(self._seg_times)
+        def pct(p):
+            return round(times[min(int(len(times) * p), len(times) - 1)], 3) if times else None
+        return {
+            "bytes_done": self._bytes_done,
+            "ts_sum": self._ts_sum,
+            "success_sum": self._success_sum,
+            "deferred_count": self._deferred_count,
+            "stage2_attempts": self._stage2_attempts,
+            "stage2_ok": self._stage2_ok,
+            "permanently_failed": len(self._permanently_failed),
+            "seg_time_p50": pct(0.50),
+            "seg_time_p95": pct(0.95),
+            "seg_time_p99": pct(0.99),
+            "seg_time_max": round(times[-1], 3) if times else None,
+        }
+
+    # ------------------------------------------------------------
     # 计数 / 进度
     # ------------------------------------------------------------
     def _bump_success(self):
@@ -195,6 +246,12 @@ class M3u8Download:
         deferred = queue.Queue()
 
         # ---- 阶段1：并发 ----
+        self._t_download_start = time.time()
+        if self._stats_hook:
+            try:
+                self._stats_hook(self)
+            except Exception:
+                pass
         sig_thread = threading.Thread(target=self.updateSignatureLoop, daemon=True)
         sig_thread.start()
 
@@ -211,6 +268,7 @@ class M3u8Download:
 
         print(f"\n[阶段1结束] 成功: {self._success_sum}/{self._ts_sum}, "
               f"待补下载: {deferred.qsize()}")
+        self._deferred_count = deferred.qsize()
 
         # ---- 阶段2：失败分片串行补下载（指数退避）----
         retry_items = []
@@ -224,7 +282,9 @@ class M3u8Download:
                 break
             ok = False
             for attempt in range(self._num_retries):
+                self._stage2_attempts += 1
                 if self._download_one_blocking(ts_url, name):
+                    self._stage2_ok += 1
                     self._bump_success()
                     ok = True
                     print(f"[补下载成功] {os.path.basename(name)} (尝试{attempt + 1})")
@@ -247,7 +307,10 @@ class M3u8Download:
     def _download_one_blocking(self, ts_url_original, name):
         """下载单个 ts。成功返回 True；失败返回 False（并清理残片）。"""
         if os.path.exists(name) and os.path.getsize(name) > 0:
-            return True  # 断点续传：已存在且非空
+            # 断点续传：已存在且非空（计入字节数，不记分片耗时）
+            with self._bytes_lock:
+                self._bytes_done += os.path.getsize(name)
+            return True
         if os.path.exists(name):
             try:
                 os.remove(name)
@@ -261,6 +324,7 @@ class M3u8Download:
                 self.timestamp, self.signature,
             )
             _dl_start = time.time()
+            _received = 0
             with utils.direct_get(
                 ts_url, stream=True, timeout=(5, 15),
                 verify=False, headers=self._headers,
@@ -276,6 +340,7 @@ class M3u8Download:
                     for chunk in res.iter_content(chunk_size=64 * 1024):
                         if chunk:
                             ts.write(chunk)
+                            _received += len(chunk)
                         if time.time() - _dl_start > self._total_timeout:
                             raise TimeoutError(
                                 f"Total timeout {self._total_timeout}s for "
@@ -283,6 +348,9 @@ class M3u8Download:
                             )
             if os.path.getsize(name) == 0:
                 raise Exception("Downloaded file is empty")
+            with self._bytes_lock:
+                self._bytes_done += _received
+            self._seg_times.append(time.time() - _dl_start)
             return True
         except Exception as e:
             logger.info(f"FAIL {os.path.basename(name)}: {type(e).__name__}: {e}")
