@@ -1,6 +1,6 @@
 """
-PPT/幻灯片提取器 - GPU加速版本
-使用FFmpeg scene filter进行场景变化检测，速度约为50x实时
+PPT/幻灯片提取器：默认 CPU stable 引擎；兼容 fused 与 legacy。
+实际速度和质量见工作目录 bench/RESULTS.md，不保证固定实时倍率。
 """
 
 import subprocess
@@ -215,7 +215,7 @@ def compute_phash(image: np.ndarray, hash_size: int = 16) -> imagehash.ImageHash
 #   只对幸存的 ~几十页做全分辨率 seek 提取。消灭第二遍解码与格式往返。
 
 FUSED_SAMPLE_WIDTH = 320      # 缩略图宽度（gray 差分与 dHash 足够）
-FUSED_FPS_SAMPLE = 5.0        # 抽样帧率：幻灯片一页停 ≥ 数秒，5fps 采样零漏检（ECO 冗余抽样）
+FUSED_FPS_SAMPLE = 5.0        # 兼容采样率；短页、渐变和小面积改动仍可能漏检。
 FUSED_BATCH = 64              # 每批读入帧数（批量 numpy 向量化，消除逐帧 Python 开销）
 FUSED_DIFF_THRESHOLD = 0.10   # 平均绝对差/255 的触发阈值
 FUSED_FRAC_THRESHOLD = 0.20   # 显著变化像素占比（|d|>24）的触发阈值
@@ -335,29 +335,34 @@ def detect_slides_single_pass(
             if n == 0:
                 break
             arr = np.frombuffer(chunk[:n * frame_bytes], dtype=np.uint8).reshape(n, th, tw)
+            has_carry = carry is not None
+            if consumed == 0:
+                candidates.append(0.0)
+                last_hash = _thumb_phash_bits(arr[0])
+                last_t = 0.0
             if carry is not None:
                 arr = np.concatenate((carry[None, :, :], arr), axis=0)
             # 批量向量化打分：arr[k] 与 arr[k+1] 的差分
             d = np.abs(arr[1:].astype(np.int16) - arr[:-1].astype(np.int16))
             mads = d.mean(axis=(1, 2)) / 255.0
             fracs = (d > 24).mean(axis=(1, 2))
-            if stats is not None:
+            if stats is not None and len(mads):
                 # 记录全程最大指标：调用方据此判断低阈值重扫是否必然徒劳
                 stats["max_mad"] = max(stats.get("max_mad", 0.0), float(mads.max()))
                 stats["max_frac"] = max(stats.get("max_frac", 0.0), float(fracs.max()))
             hits = np.nonzero((mads >= diff_threshold) | (fracs >= frac_threshold))[0]
             # hits[k] 对应变化出现在帧 (consumed + hits[k] + 1)
             for hk in hits:
-                g = consumed + int(hk) + 1  # 变化后那一帧的全局序号
+                g = consumed + int(hk) + (0 if has_carry else 1)
                 t = g / fps_sample
                 if t - last_t < min_interval:
                     continue
                 hsh = _thumb_phash_bits(arr[int(hk) + 1])
                 if last_hash is None or \
-                        int(np.count_nonzero(np.bitwise_xor(hsh, last_hash))) >= hash_dist:
+                        int(np.unpackbits(np.bitwise_xor(hsh, last_hash)).sum()) >= hash_dist:
                     candidates.append(t)
                     last_hash = hsh
-                last_t = t
+                    last_t = t
             consumed += n
             carry = arr[-1].copy()
             if total_frames and verbose and (consumed * 100 // total_frames) >= last_pct + 10:
@@ -409,15 +414,27 @@ def extract_slides(video_path: str,
                    scene_threshold: float = SCENE_THRESHOLD,
                    min_interval: float = MIN_SCENE_INTERVAL,
                    similarity_threshold: float = SIMILARITY_THRESHOLD,
-                   engine: str = "fused") -> int:
+                   engine: str = "ts_parallel_native",
+                   profile: str = "balanced",
+                   config=None,segments=None) -> int:
     """
     主函数：从视频中提取幻灯片
     返回保存的幻灯片数量
 
-    engine="fused"：单遍融合算子（默认，一次解码完成检测+去重，详见
+    engine="stable"（默认）：稳定段取帧、全局去重、写字合并与视频去抖。
+    profile="fast|balanced|thorough"；config 可覆盖 slide_pipeline.SlideConfig。
+    旧阈值参数继续作用于 fused/legacy；stable 的阈值由 profile/config 管理。
+    engine="fused"：兼容融合算子（一次解码完成检测+去重，详见
     detect_slides_single_pass 的设计说明；不可用或无结果时自动回退 legacy）
     engine="legacy"：旧管线（ffmpeg scene 全分辨率扫描 + 逐点 seek 提帧 + pHash 去重）
     """
+    if engine in ("stable","ts_parallel_native"):
+        if not Path(video_path).is_file():
+            return 0
+        from slide_pipeline import extract_stable
+        return extract_stable(video_path, output_dir, profile, config,engine,segments)
+    if engine not in ("fused", "legacy"):
+        raise ValueError(f"Unknown extraction engine: {engine}")
     if engine == "legacy":
         return extract_slides_legacy(video_path, output_dir, scene_threshold,
                                      min_interval, similarity_threshold)
@@ -437,7 +454,7 @@ def extract_slides(video_path: str,
     candidates = detect_slides_single_pass(
         video_path, min_interval=min_interval, stats=stats,
     )
-    if candidates is not None and not candidates:
+    if candidates is not None and (not candidates or candidates == [0.0]):
         # 全程最大差分连一半阈值都够不着 → 低阈值重扫必然徒劳，短路跳过
         if stats.get("max_mad", 0.0) >= FUSED_DIFF_THRESHOLD * 0.5 or                 stats.get("max_frac", 0.0) >= FUSED_FRAC_THRESHOLD * 0.5:
             print("未检测到翻页，降低阈值重试...")
@@ -602,6 +619,8 @@ def main():
                         help=f'相似度阈值 (默认: {SIMILARITY_THRESHOLD})')
     parser.add_argument('-p', '--pptx', action='store_true',
                         help='同时生成PPT文件')
+    parser.add_argument('--profile', choices=['fast', 'balanced', 'thorough'], default='balanced')
+    parser.add_argument('--engine', choices=['ts_parallel_native','stable', 'fused', 'legacy'], default='ts_parallel_native')
     
     args = parser.parse_args()
     
@@ -621,7 +640,9 @@ def main():
         args.output,
         scene_threshold=args.threshold,
         min_interval=args.min_interval,
-        similarity_threshold=args.similarity
+        similarity_threshold=args.similarity,
+        engine=args.engine,
+        profile=args.profile,
     )
     
     # 如果需要生成PPT

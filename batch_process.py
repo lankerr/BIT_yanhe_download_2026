@@ -107,6 +107,9 @@ def batch_extract_slides(
     similarity_threshold: float = 0.90,
     progress_callback: Optional[Callable] = None,
     stop_event=None,
+    profile: str = "balanced",
+    engine: str = "ts_parallel_native",
+    config=None,
 ) -> List[dict]:
     """
     批量提取课件幻灯片
@@ -160,6 +163,9 @@ def batch_extract_slides(
                 scene_threshold=scene_threshold,
                 min_interval=min_interval,
                 similarity_threshold=similarity_threshold,
+                profile=profile,
+                engine=engine,
+                config=config,
             )
             if count > 0:
                 extractor.create_pptx(slide_dir, pptx_path)
@@ -175,6 +181,13 @@ def batch_extract_slides(
                 # 无场景变化 -> 生成占位 pptx, 避免下次重复处理
                 _make_placeholder_pptx(pptx_path, video_name, "无场景变化")
                 status = "占位(无场景)"
+
+            # Other screens are useful study material, kept out of slide decks.
+            from screen_content import OTHER_DIR
+            other_dir=Path(slide_dir)/OTHER_DIR
+            if any(other_dir.glob('*.jpg')):
+                import pdf_export
+                pdf_export.create_pdf(str(other_dir),str(Path(slide_dir)/(OTHER_DIR+'.pdf')))
 
             elapsed = time.time() - start
             results.append({"name": video_name, "status": status, "slides": count, "elapsed": elapsed})
@@ -297,6 +310,7 @@ def batch_process_all(
     language: str = "zh",
     progress_callback: Optional[Callable] = None,
     stop_event=None,
+    profile: str = "balanced",
 ) -> dict:
     """
     统一批处理：课件提取 + 音频转录
@@ -309,6 +323,7 @@ def batch_process_all(
         print("=" * 60)
         all_results["slides"] = batch_extract_slides(
             input_dir, progress_callback=progress_callback, stop_event=stop_event,
+            profile=profile,
         )
 
     if do_transcribe:
@@ -342,6 +357,7 @@ def main():
 
     parser.add_argument("input_dir", help="视频所在目录")
     parser.add_argument("--slides-only", action="store_true", help="仅提取课件")
+    parser.add_argument("--profile", choices=["fast", "balanced", "thorough"], default="balanced")
     parser.add_argument("--transcribe-only", action="store_true", help="仅转录音频")
     parser.add_argument("-m", "--model", default="large-v3", help="Whisper 模型 (默认 large-v3)")
     parser.add_argument("--device", default="auto", help="设备 (auto/cuda/cpu)")
@@ -361,6 +377,7 @@ def main():
         device=args.device,
         compute_type=args.compute_type,
         language=args.language,
+        profile=args.profile,
     )
 
 

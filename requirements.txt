@@ -17,3 +17,7 @@ pyinstaller
 # ---- GPU 可选（手动安装，pip 不会自动拉，体积大）----
 # pip install torch --index-url https://download.pytorch.org/whl/cu121
 # CUDA 12.x + cuDNN 9 需要手动从 NVIDIA 官网安装
+
+# ---- 迷你登录器(token_login.py, 可选) ----
+# 复用本机 Edge(WebView2) 内核, 手动登录一次自动抓取token
+pywebview

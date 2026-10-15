@@ -1865,6 +1865,19 @@ class PostProcessFrame(ctk.CTkFrame):
         self.lang_menu.grid(row=0, column=3, padx=10, pady=10)
 
         ctk.CTkLabel(
+            param_frame, text="课件档位:",
+            font=ctk.CTkFont(size=14), text_color=G_TEXT,
+        ).grid(row=0, column=4, padx=10, pady=10, sticky="w")
+
+        self.slide_profile_var = ctk.CTk.StringVar(value="balanced")
+        self.slide_profile_menu = ctk.CTkOptionMenu(
+            param_frame, variable=self.slide_profile_var,
+            values=["fast", "balanced", "thorough"],
+            width=120,
+        )
+        self.slide_profile_menu.grid(row=0, column=5, padx=10, pady=10)
+
+        ctk.CTkLabel(
             param_frame, text="设备:",
             font=ctk.CTkFont(size=14), text_color=G_TEXT,
         ).grid(row=1, column=0, padx=10, pady=10, sticky="w")
@@ -2036,6 +2049,7 @@ class PostProcessFrame(ctk.CTkFrame):
                     language=self.lang_var.get(),
                     progress_callback=gui_progress,
                     stop_event=self._stop_event,
+                    profile=self.slide_profile_var.get(),
                 )
 
                 # 汇总
