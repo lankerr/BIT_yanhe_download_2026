@@ -17,7 +17,7 @@ AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth.txt")
 
 
 def check_auth():
-    """检查 auth.txt 里的 token 是否还有效(调一次轻量接口)"""
+    """检查 auth.txt 里的 token 是否有效(与 utils.test_auth 同款四态语义)"""
     try:
         import utils
         if not os.path.exists(AUTH_FILE):
@@ -27,13 +27,21 @@ def check_auth():
         r = utils.api_get(
             "https://cbiz.yanhekt.cn/v1/course/initiate/sign/list",
             headers=utils.headers, timeout=(10, 30))
-        j = r.json()
-        ok = j.get("code") == 0
-        print(f"token {'有效 ✓' if ok else '无效(需重新登录)'}")
-        return ok
+        code = r.json().get("code")
+        if code == 0:
+            print("token 有效 ✓")
+            return True
+        if code == 61101113:
+            print("token 无效（被服务器拒绝，需要重新登录获取）")
+            return False
+        if code == 61101114:
+            print("WAF 限流中，无法判定 token 状态（不是过期！稍后重试或换网络）")
+            return True  # 不算失败，避免误导
+        print(f"未知业务码 code={code}，无法判定")
+        return True
     except Exception as e:
-        print(f"检查失败: {e}")
-        return False
+        print(f"网络异常，无法判定 token 状态: {e}")
+        return True
 
 
 def harvest():

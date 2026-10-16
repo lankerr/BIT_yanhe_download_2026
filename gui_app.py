@@ -464,6 +464,8 @@ class LoginFrame(ctk.CTkFrame):
                             "1. 打开 https://www.yanhekt.cn 并登录\n"
                             "2. 按F12打开控制台，粘贴运行：JSON.parse(localStorage.auth).token\n"
                             "3. 复制新的认证码（32位字符）\n\n"
+                            "源码版用户可直接运行：py token_login.py\n"
+                            "（弹出登录窗口，登录成功自动抓取token）\n\n"
                             "提示：可以点击界面上的「复制」按钮直接复制代码"
                         ))
                     else:
@@ -492,9 +494,14 @@ class LoginFrame(ctk.CTkFrame):
                 if not video_list:
                     logger.warning("课程没有视频")
                     post(lambda: self.show_error(
-                        "课程无视频",
-                        f"课程 {course_name} 没有可下载的视频。\n"
-                        "请检查课程ID是否正确。"
+                        "课程无视频（token已验证有效）",
+                        f"认证有效，但课程 {course_name} 返回0节视频。\n\n"
+                        "这通常不是Token问题，可能是：\n"
+                        "1. 延河WAF对你的IP临时风控（返回空列表，几十分钟自解）\n"
+                        "2. 该课程暂未上传录像/录播已归档\n"
+                        "3. 课程ID属于往年学期\n\n"
+                        "建议：稍后重试；换网络（如手机热点）可立即验证是否IP风控；\n"
+                        "源码版可运行 py token_login.py --check 静默核验token。"
                     ))
                     post(lambda: self.fetch_btn.configure(state="normal"))
                     return
@@ -629,12 +636,12 @@ class LoginFrame(ctk.CTkFrame):
                 )
                 color = G_WARN
             else:
-                title = "🟡 Token 已被风控或过期"
+                title = "🟡 延河 WAF 限流（不是Token过期）"
                 detail = (
                     "WAF 静默拒绝（HTTP 200 + code=61101114）。\n"
-                    "原因：Token 短时间被探活过多 / 已超 24 小时。\n"
-                    "建议：浏览器重新登录延河 → F12 控制台脚本拿新 32 位 Token，\n"
-                    "或点「自动重试」等待限流窗口过期（5-15 分钟）。"
+                    "这是请求频率触发的临时限流，Token 本身大概率仍有效。\n"
+                    "建议：等 5-15 分钟后点「自动重试」，或换网络（手机热点）立即验证；\n"
+                    "不要急着换Token——先用 py token_login.py --check 核验（源码版）。"
                 )
                 color = G_WARN
         elif code in (401, 403) or http_status in (401, 403):

@@ -501,17 +501,37 @@ def remove_auth():
         os.remove(auth_path)
 
 
-def test_auth(courseID):
+def test_auth(courseID=None):
     """
     Test if the auth in headers is valid.
     Return True if the auth is valid, otherwise False.
+
+    2026-10-15 修复：旧实现拿「session列表非空」当有效，把三种与token无关的
+    空列表（WAF对某些IP软禁 / 该课无录像 / 录播归档）全部误报成"token过期"。
+    改用认证语义明确的 /v1/course/initiate/sign/list 探针：
+      code=0       → 有效
+      code=61101113 → 凭据被拒绝（token确实无效/过期）
+      code=61101114 → WAF限流，无法判定（放行，让后续流程报具体错误，
+                      绝不能报"token过期"——这是本次事故的误诊路径）
+      网络异常      → 无法判定，同上放行
     """
-    res = api_get(
-        f"https://cbiz.yanhekt.cn/v2/course/session/list?course_id={courseID}",
-        headers=headers,
-        timeout=(10, 30),  # 连接10秒，读取30秒
-    )
-    return bool(res.json()["data"])
+    try:
+        res = api_get(
+            "https://cbiz.yanhekt.cn/v1/course/initiate/sign/list",
+            headers=headers,
+            timeout=(10, 30),
+        )
+        code = res.json().get("code")
+        if code == 0:
+            return True
+        if code == 61101113:
+            return False
+        # 61101114限流 / 其他业务码：无法判定认证状态，放行
+        print(f"[test_auth] 探针返回 code={code}，无法判定token状态，按有效放行")
+        return True
+    except Exception as e:
+        print(f"[test_auth] 探针异常({type(e).__name__})，无法判定token状态，按有效放行")
+        return True
 
 
 def get_course_info(courseID):
@@ -538,7 +558,9 @@ def get_course_info(courseID):
     videoList = res.json()["data"]
     name = course.json()["data"]["name_zh"].strip()
     if not videoList:
-        raise Exception(f"该课程({name})没有视频信息，请检查课程ID是否正确")
+        # 2026-10-15: 空列表不再当异常抛出——WAF软禁/无录像/归档都会产生空列表，
+        # 让调用方(GUI)用"token已验证有效但0节视频"的专门文案区分，避免误导向"课程不存在"
+        return ([], name, "未知教师")
 
     return (
         videoList,
