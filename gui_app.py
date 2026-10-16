@@ -1876,7 +1876,7 @@ class PostProcessFrame(ctk.CTkFrame):
             font=ctk.CTkFont(size=14), text_color=G_TEXT,
         ).grid(row=0, column=4, padx=10, pady=10, sticky="w")
 
-        self.slide_profile_var = ctk.CTk.StringVar(value="balanced")
+        self.slide_profile_var = ctk.StringVar(value="balanced")
         self.slide_profile_menu = ctk.CTkOptionMenu(
             param_frame, variable=self.slide_profile_var,
             values=["fast", "balanced", "thorough"],
@@ -1955,24 +1955,36 @@ class PostProcessFrame(ctk.CTkFrame):
             self.dir_entry.insert(0, d)
 
     def _detect_gpu(self):
-        """返回 (是否可用 GPU, 用户可读提示)。检测顺序: torch.cuda → nvidia-smi。"""
-        try:
-            import torch  # type: ignore
-            if torch.cuda.is_available():
-                name = torch.cuda.get_device_name(0)
-                return True, f"✅ 检测到 GPU: {name}  —  Whisper 将以 float16 全速运行（约 30-50x 实时）"
-        except Exception:
-            pass
+        """返回 (是否可用 GPU, 用户可读提示)。
+
+        探测顺序: ctranslate2.get_cuda_device_count()（随包分发、瞬时、贴近真实
+        推理后端）→ nvidia-smi（仅取硬件名）。torch 并未随包分发，不再探测。
+        """
+        gpu_name = ""
         try:
             import subprocess as _sp
-            r = _sp.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=3)
+            r = _sp.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=3,
+                        creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
             if r.returncode == 0 and r.stdout.strip():
-                return True, f"✅ 检测到 NVIDIA GPU：{r.stdout.strip().splitlines()[0]}  —  建议先安装 CUDA 12.x + cuDNN 9 以启用加速"
+                gpu_name = r.stdout.strip().splitlines()[0]
         except Exception:
             pass
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                name = gpu_name or f"CUDA设备 x{ctranslate2.get_cuda_device_count()}"
+                return True, f"✅ 检测到可用 CUDA: {name}  —  Whisper 将以 float16 加速运行"
+        except Exception:
+            pass
+        # 有 nvidia-smi 但 CT2 看不到 CUDA：驱动在但运行库不全，仍按 CPU 路径走
+        if gpu_name:
+            return False, (
+                f"⚠️  检测到 {gpu_name}，但 CUDA 运行库不可用 — 本轮按 CPU (int8) 运行。\n"
+                "    安装 CUDA 12.x + cuDNN 9 后重开本页可恢复 GPU 加速。"
+            )
         return False, (
-            "⚠️  未检测到 GPU/CUDA — 将使用 CPU 转录（large-v3 可能很慢，建议改用 medium 或 small 模型）。\n"
-            "    GPU 用户：请安装 NVIDIA 驱动 + CUDA 12.x + cuDNN 9，并在此处选择 cuda/float16。"
+            "⚠️  未检测到 GPU/CUDA — 已自动切换 CPU (int8) 模式，无需任何配置即可转录。\n"
+            "    轻薄本建议先用 small/medium 模型；速度因机型而异（约 1-4 倍实时）。"
         )
 
     def _detect_gpu_async(self):
@@ -2206,14 +2218,55 @@ class YanheDownloaderApp(ctk.CTk):
 
 def main():
     logger.info("main() 开始执行")
-    # 确保output目录存在
-    os.makedirs("output", exist_ok=True)
-    
+    try:
+        from runtime_diagnostics import phase
+    except Exception:
+        phase = lambda *_a, **_k: None
+
+    # --safe-ui：关闭CTk自动DPI感知并固定缩放（窗口黑底/错位兼容模式），
+    # 必须在创建任何 Tk/CTk root 之前设置
+    if os.environ.get("YH_SAFE_UI"):
+        try:
+            ctk.deactivate_automatic_dpi_awareness()
+            ctk.set_widget_scaling(1.0)
+            ctk.set_window_scaling(1.0)
+            logger.info("safe-ui 已启用（DPI感知关闭，缩放固定1.0）")
+        except Exception as e:
+            logger.warning(f"safe-ui 设置失败: {e}")
+
+    # output 目录：优先 exe 当前目录（保持既有行为）；只读时落到用户目录
+    try:
+        os.makedirs("output", exist_ok=True)
+    except Exception:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        out_dir = os.path.join(base, "yanhe", "output")
+        os.makedirs(out_dir, exist_ok=True)
+        os.chdir(out_dir)
+
     try:
         logger.info("创建 YanheDownloaderApp")
         app = YanheDownloaderApp()
+        phase("root_created")
+
+        # Tk 回调异常也进日志（后处理页构造错误等原来直接吞掉）
+        def _tk_callback_exception(exc_type, exc_value, exc_tb):
+            logger.error(f"Tk回调异常: {exc_type.__name__}: {exc_value}")
+            logger.error("".join(traceback.format_tb(exc_tb)))
+        try:
+            app.report_callback_exception = _tk_callback_exception
+        except Exception:
+            pass
+
+        def _mark_alive():
+            phase("event_loop_alive")
+        try:
+            app.after(1500, _mark_alive)
+        except Exception:
+            pass
+
         logger.info("启动 mainloop")
         app.mainloop()
+        phase("closing")
     except Exception as e:
         logger.error(f"主程序异常: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())

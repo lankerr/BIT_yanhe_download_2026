@@ -45,10 +45,11 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-REM 5. 清理旧构建
+REM 5. 清理旧构建（onedir：目录形态）
 echo [STEP] 清理旧构建产物 ...
 if exist "build" rmdir /s /q "build"
-if exist "dist\延河课堂下载器-完整版.exe" del /q "dist\延河课堂下载器-完整版.exe"
+if exist "dist\延河课堂下载器-完整版" rmdir /s /q "dist\延河课堂下载器-完整版"
+if exist "dist\延河课堂下载器-完整版-onedir.zip" del /q "dist\延河课堂下载器-完整版-onedir.zip"
 
 REM 6. 打包（较慢，5-10 分钟）
 echo [STEP] PyInstaller 打包中（首次约 5-10 分钟）...
@@ -59,15 +60,25 @@ if errorlevel 1 (
 )
 
 echo.
+echo [STEP] 压缩 onedir 目录为分发 ZIP（较慢，请等待）...
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\延河课堂下载器-完整版\*' -DestinationPath 'dist\延河课堂下载器-完整版-onedir.zip' -Force"
+if errorlevel 1 (
+    echo [ERR] ZIP 压缩失败（可直接分发 dist 目录）
+) else (
+    echo   分发包: dist\延河课堂下载器-完整版-onedir.zip
+)
+
+echo.
 echo ============================================================
-echo   打包完成
+echo   打包完成（onedir 形态）
 echo ============================================================
-for %%A in ("dist\延河课堂下载器-完整版.exe") do echo   输出: %%~fA  ^(%%~zA bytes^)
+echo   目录: dist\延河课堂下载器-完整版echo   用户用法: 解压 ZIP 后运行目录内的 exe（勿单独拷出 exe）
+echo   自检: 完整版.exe --syscheck   安全界面: 完整版.exe --safe-ui
 echo.
 echo   首次启动「后处理工具」时会自动下载 Whisper 模型（~3GB / large-v3）
 echo   下载源：%%HF_ENDPOINT%% = https://hf-mirror.com
 echo.
 
-set /p test="是否立即启动测试？(Y/N): "
-if /i "%test%"=="Y" start "" "dist\延河课堂下载器-完整版.exe"
+set /p test="是否立即运行 --syscheck 自检测试？(Y/N): "
+if /i "%test%"=="Y" start "" /wait "dist\延河课堂下载器-完整版\延河课堂下载器-完整版.exe" --syscheck
 endlocal

@@ -99,3 +99,10 @@ release-assets/
 
 # ---- 浏览器自动化本地缓存 ----
 cookies.pkl
+
+# 凭据与构建产物不进库
+auth.txt.bak*
+dist_token/
+dist/
+build/
+*.log

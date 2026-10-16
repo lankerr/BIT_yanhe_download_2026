@@ -30,7 +30,8 @@ hiddenimports = [
     'ppt_extractor_gpu', 'audio_transcriber_gpu', 'batch_process',
     'cv2', 'numpy', 'imagehash', 'pptx',
     'faster_whisper', 'ctranslate2', 'tokenizers', 'huggingface_hub',
-    'tqdm',
+    'onnxruntime', 'onnxruntime.capi._pybind_state',
+    'tqdm', 'runtime_diagnostics', 'syscheck',
 ]
 
 _d, _b, _h = collect_all('customtkinter')
@@ -38,7 +39,7 @@ datas += _d
 binaries += _b
 hiddenimports += _h
 
-for _pkg in ('faster_whisper', 'ctranslate2', 'tokenizers'):
+for _pkg in ('faster_whisper', 'ctranslate2', 'tokenizers', 'onnxruntime'):
     try:
         datas += collect_data_files(_pkg)
         binaries += collect_dynamic_libs(_pkg)
@@ -65,7 +66,7 @@ hiddenimports += [
 
 excludes = [
     'torch', 'torchaudio', 'torchvision',
-    'tensorflow', 'transformers', 'onnxruntime',
+    'tensorflow', 'transformers',
     'pandas', 'matplotlib', 'scipy', 'sklearn', 'skimage',
     'bokeh', 'panel', 'plotly', 'dask', 'distributed', 'xarray',
     'selenium', 'sqlalchemy', 'h5py', 'nltk', 'spacy',
@@ -92,20 +93,19 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# 2026-10-16 黑屏修复：主发布改 onedir —— onefile 每次启动把 365MB 自解压到
+# %TEMP%，慢盘+杀软扫描的轻薄本上数分钟无窗口（用户感知"黑屏"）。
+# onedir 解压一次后常驻，启动只剩正常加载。upx=False 防杀软误杀加壳 DLL。
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='延河课堂下载器-完整版',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=['vcruntime140.dll', 'python3*.dll'],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -113,4 +113,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['yhkt.ico'],
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='延河课堂下载器-完整版',
 )

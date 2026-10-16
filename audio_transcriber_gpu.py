@@ -62,6 +62,59 @@ LONG_AUDIO_CHUNK_SECONDS = 20 * 60
 LONG_AUDIO_CHUNK_THRESHOLD_SECONDS = 30 * 60
 
 
+# ==================== 显卡自适应（无 NVIDIA 机器零配置可用） ====================
+
+def probe_cuda_support() -> bool:
+    """CT2 视角的 CUDA 可用性（比 torch 更贴近真实推理后端，且随包分发）。"""
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def resolve_backend(device: str, compute_type: str):
+    """返回 (effective_device, effective_compute_type, note)。
+
+    关键约束：CTranslate2 在 CPU 上不支持 float16 —— 旧默认 float16 会让
+    纯 CPU 机器（轻薄本）在加载模型时直接抛错，这里统一收敛。
+    """
+    note = ""
+    cuda_ok = probe_cuda_support()
+    if device in ("auto", ""):
+        device = "cuda" if cuda_ok else "cpu"
+    if device == "cuda" and not cuda_ok:
+        device = "cpu"
+        note = "未检测到可用 CUDA，已自动回退 CPU/int8"
+    if device == "cpu" and compute_type in ("float16", "auto", ""):
+        compute_type = "int8"
+        note = note or "CPU 模式自动选择 int8 量化"
+    elif device == "cuda" and compute_type in ("auto", ""):
+        compute_type = "float16"
+    return device, compute_type, note
+
+
+def _pick_cpu_threads() -> int:
+    """CPU 线程策略：物理核近似、上限 8；可用 YH_CPU_THREADS 覆盖。
+
+    os.cpu_count() 是逻辑核数，超线程/P+E 核轻薄本全占会超订阅，
+    取一半（至少 1、至多 8）是稳妥起点；追求极限可实测 2/4/6/8。
+    """
+    override = os.environ.get("YH_CPU_THREADS")
+    if override and override.isdigit() and int(override) > 0:
+        return int(override)
+    logical = os.cpu_count() or 4
+    return max(1, min(8, logical // 2))
+
+
+def _looks_like_backend_error(exc: Exception) -> bool:
+    """区分『后端/显存类失败可降级』与『业务失败不该伪装成GPU问题』。"""
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(k in msg for k in (
+        "out of memory", "oom", "cuda", "cublas", "cudnn",
+        "allocat", "device", "compute type", "float16", "not supported"))
+
+
 def check_ffmpeg() -> bool:
     """检查 FFmpeg 是否可用"""
     try:
@@ -229,6 +282,7 @@ class AudioTranscriber:
         beam_size: int = DEFAULT_BEAM_SIZE,
         vad_filter: bool = DEFAULT_VAD_FILTER,
         batch_size: int = 0,
+        speed_profile: str = "auto",
     ):
         if not HAS_WHISPER:
             raise ImportError(
@@ -243,41 +297,76 @@ class AudioTranscriber:
         self.beam_size = beam_size
         self.vad_filter = vad_filter
         self.batch_size = batch_size  # 0 = 按设备自动选择
+        # 速度档：auto = CPU 用快速档(beam1)、GPU 用精度档(beam5)；
+        # fast/balanced = 显式覆盖。快速档参数见 _transcribe_options()
+        self.speed_profile = speed_profile
         self.model = None
         self.batched_model = None  # BatchedInferencePipeline（可用时启用，GPU 典型 4x 提速）
 
     def load_model(self, progress_callback: Optional[Callable] = None):
-        """加载 Whisper 模型"""
+        """加载 Whisper 模型（含显卡自适应：CUDA 不可用/CUDA 加载失败 → CPU int8）"""
         if self.model is not None:
             return
 
-        print(f"正在加载 Whisper 模型: {self.model_size}")
+        # --- 显卡自适应：auto/float16 在纯 CPU 机器上收敛为可用组合 ---
+        self.device, self.compute_type, note = resolve_backend(
+            self.device, self.compute_type)
+        if note:
+            print(f"⚠ {note}")
+
+        # CPU 自动模型降级：large-v3 在轻薄本上约 0.15-0.6x 实时（不可用级），
+        # auto 路径降到 small（约 1-4x 实时）。手动显式选 large-v3 不暗中变小，
+        # 需要 CPU 强跑大模型可设环境变量 YH_CPU_MODEL=keep。
+        effective_model = self.model_size
+        if (self.device == "cpu" and self.model_size == "large-v3"
+                and os.environ.get("YH_CPU_MODEL") != "keep"):
+            effective_model = "small"
+            print("⚠ CPU 模式默认模型降级: large-v3 → small（速度优先）。"
+                  "如需 CPU 强跑 large-v3，设环境变量 YH_CPU_MODEL=keep")
+
+        print(f"正在加载 Whisper 模型: {effective_model}")
         print(f"设备: {self.device}, 计算类型: {self.compute_type}")
 
         if progress_callback:
             progress_callback(0, 100, "正在加载模型...")
 
         start = time.time()
-        # CPU 上显式给满线程数，否则 ctranslate2 默认只用 4 线程，int8 会慢很多
-        cpu_threads = os.cpu_count() or 4
+        # 线程策略：物理核近似、上限 8（满逻辑核在轻薄本上会超订阅）
+        cpu_threads = _pick_cpu_threads()
+        if self.device == "cpu":
+            os.environ.setdefault("OMP_NUM_THREADS", str(cpu_threads))
+            print(f"CPU 线程数: {cpu_threads}")
+
         try:
             self.model = WhisperModel(
-                self.model_size,
+                effective_model,
                 device=self.device,
                 compute_type=self.compute_type,
                 cpu_threads=cpu_threads,
             )
         except Exception as e:
-            # 常见坑：系统挂着死代理（如 Clash 已退出但注册表代理仍在）时，
-            # huggingface_hub 下载模型会 ConnectionError/LocalEntryNotFoundError。
-            # 与下载引擎同样的策略：强制直连重试一次。
-            if self.model is None and ("connection" in str(e).lower() or "localentry" in type(e).__name__.lower()
-                                       or "proxy" in str(e).lower() or "offline" in str(e).lower()
-                                       or "metadata" in str(e).lower()):
+            if self.model is None and _looks_like_backend_error(e):
+                # CUDA 加载失败（驱动/运行库不全、显存不足等）→ CPU int8 重试
+                print(f"⚠ GPU 加载失败，回退 CPU/int8 重试: {type(e).__name__}: {e}")
+                self.device, self.compute_type = "cpu", "int8"
+                cpu_threads = _pick_cpu_threads()
+                os.environ.setdefault("OMP_NUM_THREADS", str(cpu_threads))
+                self.model = WhisperModel(
+                    effective_model,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    cpu_threads=cpu_threads,
+                )
+            elif self.model is None and ("connection" in str(e).lower() or "localentry" in type(e).__name__.lower()
+                                         or "proxy" in str(e).lower() or "offline" in str(e).lower()
+                                         or "metadata" in str(e).lower()):
+                # 常见坑：系统挂着死代理（如 Clash 已退出但注册表代理仍在）时，
+                # huggingface_hub 下载模型会 ConnectionError/LocalEntryNotFoundError。
+                # 与下载引擎同样的策略：强制直连重试一次。
                 print(f"⚠ 模型下载失败（可能被系统代理拦截），强制直连重试: {type(e).__name__}")
                 os.environ["NO_PROXY"] = os.environ["no_proxy"] = _HF_NO_PROXY
                 self.model = WhisperModel(
-                    self.model_size,
+                    effective_model,
                     device=self.device,
                     compute_type=self.compute_type,
                     cpu_threads=cpu_threads,
@@ -304,10 +393,11 @@ class AudioTranscriber:
     def _effective_batch_size(self) -> int:
         if self.batch_size and self.batch_size > 0:
             return self.batch_size
-        # 自动：GPU 用 16（large-v3 float16 约需 3-4GB 显存），CPU 用 8
+        # 自动：GPU 用 16（large-v3 float16 约需 3-4GB 显存）；
+        # CPU 从 2 起步（轻薄本内存有限，batch 8 峰值可达 3.6GB+）
         # 注意设备在底层 ctranslate2 模型上（faster-whisper 1.2 的 WhisperModel 无 .device）
         dev = str(getattr(getattr(self.model, "model", None), "device", "cpu")).lower()
-        return 16 if "cuda" in dev else 8
+        return 16 if "cuda" in dev else 2
 
     def transcribe_file(
         self,
@@ -387,22 +477,38 @@ class AudioTranscriber:
             pbar = tqdm(total=int(duration), unit="s", desc="转录中",
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}, {rate_fmt}]")
 
+        def _speed_fast() -> bool:
+            """CPU 默认走快速档（beam1）；GPU 保持精度档（beam5）。"""
+            return (self.speed_profile == "fast"
+                    or (self.speed_profile == "auto" and self.device == "cpu"))
+
         def _run_engine(source_path: str, offset: float):
             """按可用引擎执行一次转写；批量管线 OOM 时自动降级经典管线重跑。"""
+            fast = _speed_fast()
             common = dict(
                 language=self.language,
-                beam_size=self.beam_size,
+                beam_size=1 if fast else self.beam_size,
                 vad_filter=self.vad_filter,
                 vad_parameters=dict(
-                    min_silence_duration_ms=2000,
+                    # 快速档静音阈值放宽到 1s（起点值，低声/远场音频建议切精度档）
+                    min_silence_duration_ms=1000 if fast else 2000,
                     speech_pad_ms=400,
                 ),
                 condition_on_previous_text=False,
             )
+            if fast:
+                common["temperature"] = 0.0
             if self.batched_model is not None:
+                batch_kwargs = dict(common)
                 try:
                     return self.batched_model.transcribe(
-                        source_path, batch_size=self._effective_batch_size(), **common,
+                        source_path, batch_size=self._effective_batch_size(), **batch_kwargs,
+                    )
+                except TypeError:
+                    # 批量管线不支持个别参数（如 temperature）时去掉重试
+                    batch_kwargs.pop("temperature", None)
+                    return self.batched_model.transcribe(
+                        source_path, batch_size=self._effective_batch_size(), **batch_kwargs,
                     )
                 except Exception as e:
                     msg = str(e).lower()
@@ -411,38 +517,69 @@ class AudioTranscriber:
                         self.batched_model = None
                     else:
                         raise
+            if fast:
+                common.setdefault("best_of", 1)
             return self.model.transcribe(source_path, **common)
 
-        def consume_transcription(source_path: str, offset: float = 0.0) -> None:
+        def _degrade_backend() -> bool:
+            """推理中途后端失败时的降级阶梯：批量→经典→CPU。"""
+            if self.batched_model is not None:
+                self.batched_model = None
+                print("已禁用批量管线，改用经典逐段推理重跑")
+                return True
+            if str(self.device).lower() == "cuda":
+                print("GPU 推理反复失败，切换 CPU/int8 并重载模型")
+                self.device, self.compute_type = "cpu", "int8"
+                self.model = None
+                self.load_model()
+                return True
+            return False
+
+        def consume_transcription(source_path: str, offset: float = 0.0,
+                                  _retried: bool = False) -> None:
             nonlocal detected_lang, lang_prob, last_pos
             segments_iter, info = _run_engine(source_path, offset)
             detected_lang = info.language
             lang_prob = info.language_probability
 
-            for seg in segments_iter:
-                start = max(0.0, min(duration, offset + seg.start))
-                end = max(start, min(duration, offset + seg.end))
-                text = seg.text.strip()
-                if not text:
-                    continue
-                segments.append((start, end, text))
-                full_text_parts.append(text)
+            # 生成器在迭代期间才真正推理 —— 显存/CUDA 类失败发生在这一段。
+            # 以块为提交单位：本块全部段先暂存，成功才写入全局结果，
+            # 失败降级后重跑本块，不会产生重复字幕。
+            block = []
+            try:
+                for seg in segments_iter:
+                    start = max(0.0, min(duration, offset + seg.start))
+                    end = max(start, min(duration, offset + seg.end))
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+                    block.append((start, end, text))
 
-                if pbar is not None:
-                    new_pos = min(int(end), int(duration))
-                    if new_pos > last_pos:
-                        pbar.update(new_pos - last_pos)
-                        last_pos = new_pos
+                    if pbar is not None:
+                        new_pos = min(int(end), int(duration))
+                        if new_pos > last_pos:
+                            pbar.update(new_pos - last_pos)
+                            last_pos = new_pos
 
-                if duration > 0 and progress_callback:
-                    progress = min(95, int(5 + 90 * end / duration))
-                    progress_callback(
-                        progress, 100,
-                        f"转录中 {format_timestamp_readable(end)}/{duration_str}..."
-                    )
+                    if duration > 0 and progress_callback:
+                        progress = min(95, int(5 + 90 * end / duration))
+                        progress_callback(
+                            progress, 100,
+                            f"转录中 {format_timestamp_readable(end)}/{duration_str}..."
+                        )
 
-                if pbar is None and len(segments) % 10 == 0:
-                    print(f"  已转录 {len(segments)} 段, 到 {format_timestamp_readable(end)}")
+                    if pbar is None and len(block) % 10 == 0:
+                        print(f"  已转录 {len(segments) + len(block)} 段, 到 {format_timestamp_readable(end)}")
+            except Exception as e:
+                if _retried or not _looks_like_backend_error(e):
+                    raise
+                print(f"⚠ 推理中途中断({type(e).__name__}: {e})，尝试降级重跑本块")
+                if _degrade_backend():
+                    return consume_transcription(source_path, offset, _retried=True)
+                raise
+
+            segments.extend(block)
+            full_text_parts.extend(t for _, _, t in block)
 
         if duration >= LONG_AUDIO_CHUNK_THRESHOLD_SECONDS:
             import shutil
