@@ -12,21 +12,45 @@
 """
 import sys, os, json, time, argparse
 
+# Windows 后台/GUI启动时控制台默认GBK, ✓等字符会UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 LOGIN_URL = "https://www.yanhekt.cn/login?type=bit"
-AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth.txt")
+# PyInstaller 打包后 __file__ 指向临时解压目录，改用 exe 所在目录
+_BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+AUTH_FILE = os.path.join(_BASE, "auth.txt")
 
 
 def check_auth():
-    """检查 auth.txt 里的 token 是否有效(与 utils.test_auth 同款四态语义)"""
+    """检查 auth.txt 里的 token 是否有效(与 utils.test_auth 同款四态语义, 独立实现避免拉入下载器依赖)"""
+    import hashlib
     try:
-        import utils
-        if not os.path.exists(AUTH_FILE):
-            print("auth.txt 不存在")
-            return False
-        utils.read_auth()
-        r = utils.api_get(
-            "https://cbiz.yanhekt.cn/v1/course/initiate/sign/list",
-            headers=utils.headers, timeout=(10, 30))
+        import requests
+    except ImportError:
+        print("缺少 requests: pip install requests")
+        return False
+    if not os.path.exists(AUTH_FILE):
+        print("auth.txt 不存在（先登录一次生成）")
+        return False
+    token = open(AUTH_FILE, encoding="utf-8").read().strip()
+    magic = "1138b69dfef641d9d7ba49137d2d4875"
+    ts = str(int(time.time()))
+    sig = hashlib.md5((magic + "_v1_" + ts).encode()).hexdigest()
+    h = {
+        "Origin": "https://www.yanhekt.cn",
+        "Referer": "https://www.yanhekt.cn/",
+        "xdomain-client": "web_user",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+        "Xclient-Signature": sig, "Xclient-Version": "v1", "Xclient-Timestamp": ts,
+        "Authorization": "Bearer " + token,
+    }
+    try:
+        r = requests.get("https://cbiz.yanhekt.cn/v1/course/initiate/sign/list",
+                         headers=h, timeout=(10, 30))
         code = r.json().get("code")
         if code == 0:
             print("token 有效 ✓")
@@ -36,7 +60,7 @@ def check_auth():
             return False
         if code == 61101114:
             print("WAF 限流中，无法判定 token 状态（不是过期！稍后重试或换网络）")
-            return True  # 不算失败，避免误导
+            return True
         print(f"未知业务码 code={code}，无法判定")
         return True
     except Exception as e:
@@ -45,41 +69,60 @@ def check_auth():
 
 
 def harvest():
-    """打开WebView2窗口, 轮询localStorage直到出现登录token"""
+    """打开WebView2窗口: 事件钩子+2秒轮询双保险抓 localStorage.auth
+    (pywebview 5+/6+: create_window 无 on_loaded 形参, 用 window.events.loaded 实例事件;
+     延河是SPA, token可能在首屏加载完成之后才写入, 故加轮询线程)"""
+    import threading
     import webview  # pywebview
 
     result = {"token": None}
 
-    def on_loaded(window):
-        # 页面每次加载后都探一次 localStorage.auth
+    def probe(window):
         try:
             val = window.evaluate_js("localStorage.getItem('auth')")
         except Exception:
-            return
-        if not val:
+            return  # 窗口已关等
+        if not val or result["token"]:
             return
         try:
             auth = json.loads(val)
         except Exception:
             return
-        if auth.get("login") and auth.get("token") and not result["token"]:
-            result["token"] = auth["token"]
+        if auth.get("login") and auth.get("token"):
+            result["token"] = auth["token"].strip()
             exp = auth.get("expired_at")
-            if exp:
-                exp_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(exp / 1000))
-            else:
-                exp_str = "未知"
-            window.evaluate_js(
-                f"document.body.innerHTML='<h2 style=\"padding:40px;font-family:sans-serif\">"
-                f"✅ 登录成功, token已捕获 (有效至 {exp_str})<br>窗口即将自动关闭…</h2>'")
+            exp_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(exp / 1000)) if exp else "未知"
+            try:
+                window.evaluate_js(
+                    f"document.body.innerHTML='<h2 style=\"padding:40px;font-family:sans-serif\">"
+                    f"登录成功, token已捕获 (有效至 {exp_str})<br>窗口即将自动关闭…</h2>'")
+            except Exception:
+                pass
             time.sleep(1.5)
-            window.destroy()
+            try:
+                window.destroy()
+            except Exception:
+                pass
 
-    webview.create_window(
+    window = webview.create_window(
         "延河课堂登录 - token获取器 (登录成功自动关闭)",
         LOGIN_URL, width=1100, height=800,
-        on_loaded=on_loaded,
     )
+    try:
+        window.events.loaded += lambda: probe(window)
+    except Exception:
+        pass  # 老版本pywebview无events, 仅靠轮询
+
+    def poller():
+        while not result["token"]:
+            time.sleep(2)
+            probe(window)
+            try:
+                window.evaluate_js("1")  # 窗口关了会抛, 退出轮询
+            except Exception:
+                return
+
+    threading.Thread(target=poller, daemon=True).start()
     webview.start()  # Windows 上默认使用 Edge WebView2
     return result["token"]
 
