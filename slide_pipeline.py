@@ -118,7 +118,11 @@ class SlideConfig:
 
 
 PROFILES = {
-    "fast": SlideConfig(fps=1.0, stable_seconds=1.5, seek_workers=4),
+    # 2026-10-20 codex复核：fast 原来只降采样率，native_workers=4 路并发 ffmpeg
+    # 在弱核轻薄本上照样打满 CPU（卡顿/黑窗来源之一）。fast=真低资源档：
+    # 单并发解码 + 单 seek 线程 + 显式 1 解码线程。
+    "fast": SlideConfig(fps=1.0, stable_seconds=1.5, seek_workers=1,
+                        native_workers=1, threads=1),
     "balanced": SlideConfig(),
     "thorough": SlideConfig(width=480, fps=5.0, stable_seconds=.6,
                              change_frac=.002, duplicate_frac=.0006),
@@ -146,7 +150,8 @@ def profile_config(profile="balanced", **overrides):
 def probe(path):
     r = subprocess.run([ffprobe_path(), "-v", "error", "-select_streams", "v:0",
                         "-show_entries", "stream=width,height,avg_frame_rate,start_time:format=duration",
-                        "-of", "json", str(path)], capture_output=True, timeout=30)
+                        "-of", "json", str(path)], capture_output=True, timeout=30,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if r.returncode:
         raise RuntimeError(r.stderr.decode("utf-8", errors="replace")[-2000:])
     info = json.loads(r.stdout)
@@ -163,7 +168,8 @@ def wait_for_gpu(max_used_mb=1536, timeout=300):
     start = time.monotonic()
     while True:
         r = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if r.returncode:
             raise RuntimeError("nvidia-smi failed: " + r.stderr)
         used = int(r.stdout.strip().splitlines()[0])
@@ -222,7 +228,11 @@ def thumbnails(path, cfg, start=None, end=None, stats=None,video_info=None,phase
     frame_bytes = w*h
     # Drain stderr concurrently and pair each small frame with its real source
     # PTS. Ordinal/fps timestamps can choose the wrong frame in VFR animations.
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_bytes*16)
+    # 2026-10-20: 隐藏 ffmpeg 控制台——弱机上导出期间弹出的黑色控制台窗口
+    # 会被用户当成"黑屏"（师弟反馈的直接嫌疑之一）
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         bufsize=frame_bytes*16,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     times=queue.Queue()
     errors=deque(maxlen=100)
     def drain():
@@ -839,7 +849,8 @@ def write_pages(path,output_dir,pages,cfg,stats=None):
             seek=max(0,t-preroll)
             cmd=[ffmpeg_path(),"-v","error","-threads","1","-ss",f"{seek:.6f}","-i",str(path),
                  "-ss",f"{t-seek:.6f}","-an","-sn","-dn","-frames:v","1","-threads","1","-f","rawvideo","-pix_fmt","bgr24","-"]
-            r=subprocess.run(cmd,capture_output=True,timeout=60)
+            r=subprocess.run(cmd,capture_output=True,timeout=60,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if r.returncode or len(r.stdout)!=w*h*3:
                 raise RuntimeError(f"Full-resolution seek failed at {t:.3f}s: " + r.stderr.decode("utf-8",errors="replace")[-1000:])
             a=np.frombuffer(r.stdout,np.uint8).reshape(h,w,3)

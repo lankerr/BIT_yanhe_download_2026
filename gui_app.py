@@ -101,11 +101,10 @@ from theme import (  # noqa: E402
 
 
 # ---------- 跨线程 UI 调度 ----------
-# Python 3.13+ 的 tkinter 禁止从后台线程调用 after()（直接 RuntimeError:
-# "main thread is not in main loop"），历史上所有 worker 线程都用
-# post(...) 回主线程刷界面，在新版 Python 上会静默失效。
-# 统一改为 post(fn) 投递队列，由主循环每 30ms 轮询执行（与下载页
-# progress_queue 轮询模式同构）。post 在主线程调用也安全（最多延迟一拍）。
+# tkinter 跨线程调用依赖 Tcl 事件循环与具体操作，行为并不保证稳定
+# （2026-10-20 codex复核纠正：并非"Python 3.13+ 明令禁止"的官方规则）。
+# 统一走 post(fn) 投递队列、由主循环每 30ms 轮询执行，是确定性的好设计
+# （与下载页 progress_queue 轮询模式同构）。post 在主线程调用也安全。
 _ui_call_queue: "queue.Queue" = queue.Queue()
 
 
@@ -115,12 +114,20 @@ def post(fn):
 
 
 def _drain_ui_calls(root):
-    """主线程轮询：排空 UI 回调队列并自我重新调度（勿在 worker 线程调用）"""
-    while True:
+    """主线程轮询：排空 UI 回调队列并自我重新调度（勿在 worker 线程调用）
+
+    2026-10-20 codex复核：原来 while True 不设上限，进度消息持续生产时
+    drain 自身就能吃满主线程造成卡顿/黑窗。每轮最多处理 20 条且限时 ~8ms，
+    剩余下一轮 30ms 后继续，不丢消息。
+    """
+    budget_until = time.monotonic() + 0.008
+    handled = 0
+    while handled < 20 and time.monotonic() < budget_until:
         try:
             fn = _ui_call_queue.get_nowait()
         except queue.Empty:
             break
+        handled += 1
         try:
             fn()
         except Exception:
@@ -2045,17 +2052,30 @@ class PostProcessFrame(ctk.CTkFrame):
         self.back_btn.configure(state="disabled")
         self._log("开始处理...")
 
+        # 2026-10-20 codex复核：Tk Variable 必须在主线程一次性快照成普通数据，
+        # worker 里跨线程 .get() 依赖 Tcl 线程行为不可靠
+        cfg = {
+            "do_slides": self.do_slides_var.get(),
+            "do_transcribe": self.do_transcribe_var.get(),
+            "model_size": self.model_var.get(),
+            "device": self.device_var.get(),
+            "compute_type": self.compute_var.get(),
+            "language": self.lang_var.get(),
+            "profile": self.slide_profile_var.get(),
+        }
+
         def worker():
-            # 弱CPU轻薄本防"窗口黑屏"：提取/转录是重CPU循环，会把GIL/调度打满，
-            # tkinter主线程抢不到时间片 → 窗口停止重绘被Windows涂黑（无报错）。
-            # 把本worker线程降到 BelowNormal 优先级，主线程恒赢调度；多核机上
-            # 提取速度几乎不受影响。
+            # 辅助措施（非保证）：本线程降 BelowNormal 优先级，降低与 UI 主线程
+            # 的调度竞争。注意这不能解除 GIL/锁等待，也不覆盖 ffmpeg 子进程。
             try:
                 import ctypes
-                ctypes.windll.kernel32.SetThreadPriority(
-                    ctypes.windll.kernel32.GetCurrentThread(), -1)  # THREAD_PRIORITY_BELOW_NORMAL
-            except Exception:
-                pass
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                k32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                k32.SetThreadPriority.restype = ctypes.c_int
+                if not k32.SetThreadPriority(k32.GetCurrentThread(), -1):
+                    logger.warning(f"SetThreadPriority 失败 err={ctypes.get_last_error()}")
+            except Exception as e:
+                logger.warning(f"线程优先级设置异常: {e}")
             try:
                 import batch_process
 
@@ -2077,27 +2097,35 @@ class PostProcessFrame(ctk.CTkFrame):
 
                 results = batch_process.batch_process_all(
                     input_dir,
-                    do_slides=self.do_slides_var.get(),
-                    do_transcribe=self.do_transcribe_var.get(),
-                    model_size=self.model_var.get(),
-                    device=self.device_var.get(),
-                    compute_type=self.compute_var.get(),
-                    language=self.lang_var.get(),
+                    do_slides=cfg["do_slides"],
+                    do_transcribe=cfg["do_transcribe"],
+                    model_size=cfg["model_size"],
+                    device=cfg["device"],
+                    compute_type=cfg["compute_type"],
+                    language=cfg["language"],
                     progress_callback=gui_progress,
                     stop_event=self._stop_event,
-                    profile=self.slide_profile_var.get(),
+                    profile=cfg["profile"],
                 )
 
-                # 汇总
+                # 汇总（2026-10-20 codex复核：有失败/占位绝不能显示 ✅——
+                # 师弟"提取不了却以为成功"的直接来源）
                 slide_results = results.get("slides", [])
                 transcript_results = results.get("transcripts", [])
                 slide_ok = sum(1 for r in slide_results if "成功" in r.get("status", ""))
                 trans_ok = sum(1 for r in transcript_results if "成功" in r.get("status", ""))
+                slide_fail = [r for r in slide_results if "失败" in r.get("status", "")]
 
                 summary = f"处理完成! 课件: {slide_ok}/{len(slide_results)}, 转录: {trans_ok}/{len(transcript_results)}"
                 if getattr(self, "_stop_event", None) and self._stop_event.is_set():
                     summary = f"已手动停止。已完成 — {summary}"
-                post(lambda: self._log(f"✅ {summary}"))
+                all_ok = (slide_ok == len(slide_results)) and (trans_ok == len(transcript_results))
+                icon = "✅" if all_ok else ("⚠️" if not slide_fail else "❌")
+                post(lambda: self._log(f"{icon} {summary}"))
+                for r in slide_fail:
+                    post(lambda r=r: self._log(f"    ✗ {r['name']}: {r['status'][:120]}"))
+                if slide_fail:
+                    post(lambda: self._log("    失败项已写入 .failed 标记，可直接重试"))
                 post(lambda: self.progress_label.configure(text=summary))
                 post(lambda: self.progress_bar.set(1))
 
@@ -2111,12 +2139,15 @@ class PostProcessFrame(ctk.CTkFrame):
                 ))
             except Exception as e:
                 tb = traceback.format_exc()
-                lines = [f"❌ 处理失败: {e}"] + ["    " + l for l in tb.strip().splitlines()[-8:]]
+                log_path = ""
                 try:
-                    from runtime_diagnostics import get_log_file
-                    lines.append(f"完整堆栈已存: {get_log_file()}")
+                    from runtime_diagnostics import persist
+                    log_path = persist("后处理失败", tb)
                 except Exception:
                     pass
+                lines = [f"❌ 处理失败: {e}"] + ["    " + l for l in tb.strip().splitlines()[-8:]]
+                if log_path:
+                    lines.append(f"完整堆栈已写入: {log_path}")
                 for msg in lines:
                     post(lambda m=msg: self._log(m))
                 post(lambda e=e, tb=tb: messagebox.showerror(

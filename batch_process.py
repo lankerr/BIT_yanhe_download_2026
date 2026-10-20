@@ -168,7 +168,11 @@ def batch_extract_slides(
                 config=config,
             )
             if count > 0:
-                extractor.create_pptx(slide_dir, pptx_path)
+                pptx_result = extractor.create_pptx(slide_dir, pptx_path)
+                # 2026-10-20 codex复核：create_pptx 可能静默返回 None（缺依赖/无图），
+                # 不验证就报成功 = 师弟"提取不了PPT却无报错"的路径之一
+                if not pptx_result or not os.path.exists(pptx_path) or os.path.getsize(pptx_path) < 1024:
+                    raise RuntimeError(f"PPT生成异常(create_pptx={pptx_result!r})")
                 # 同步导出 PDF (pptx 路径后缀换成 .pdf), 失败不影响主流程
                 try:
                     import pdf_export
@@ -177,6 +181,10 @@ def batch_extract_slides(
                     print(f"PDF 导出失败(不影响PPT): {e}")
                 total_slides += count
                 status = f"成功({count}张)"
+                try:
+                    os.remove(pptx_path + ".failed")
+                except OSError:
+                    pass
             else:
                 # 无场景变化 -> 生成占位 pptx, 避免下次重复处理
                 _make_placeholder_pptx(pptx_path, video_name, "无场景变化")
@@ -186,18 +194,30 @@ def batch_extract_slides(
             from screen_content import OTHER_DIR
             other_dir=Path(slide_dir)/OTHER_DIR
             if any(other_dir.glob('*.jpg')):
-                import pdf_export
-                pdf_export.create_pdf(str(other_dir),str(Path(slide_dir)/(OTHER_DIR+'.pdf')))
+                # 2026-10-20 codex复核：此 PDF 失败绝不能落进外层 except —— 那会用
+                # 占位 pptx 覆盖刚刚成功的 PPT
+                try:
+                    import pdf_export
+                    pdf_export.create_pdf(str(other_dir),str(Path(slide_dir)/(OTHER_DIR+'.pdf')))
+                except Exception as e:
+                    print(f"  其他画面PDF导出失败(不影响PPT): {e}")
 
             elapsed = time.time() - start
             results.append({"name": video_name, "status": status, "slides": count, "elapsed": elapsed})
 
         except Exception as e:
             elapsed = time.time() - start
+            import traceback
             print(f"  失败: {e}")
-            # 崩溃同样生成占位, 避免 watchdog 死循环
-            _make_placeholder_pptx(pptx_path, video_name, f"处理异常: {type(e).__name__}")
-            results.append({"name": video_name, "status": f"失败占位: {e}", "slides": 0, "elapsed": elapsed})
+            traceback.print_exc()
+            # 2026-10-20 codex复核：失败不再生成占位 pptx —— 占位会阻断下次重试
+            # （师弟升级后永远不重新提取的路径）。改写 .failed 标记，下轮自动重试。
+            try:
+                with open(pptx_path + ".failed", "w", encoding="utf-8") as f:
+                    f.write(f"{type(e).__name__}: {e}\n")
+            except OSError:
+                pass
+            results.append({"name": video_name, "status": f"失败: {e}", "slides": 0, "elapsed": elapsed})
 
     print(f"\n{'=' * 60}")
     print(f"课件提取完成! 总计: {total_slides} 张")

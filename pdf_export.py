@@ -30,11 +30,17 @@ def create_pdf(image_dir: str, output_pdf: str = None) -> str:
     print(f"\n=== 生成PDF ===\n  图片数量: {len(images)}")
 
     # 逐个打开图片, 用完及时 close, 避免大目录句柄耗尽
+    # 2026-10-20 codex复核：原实现把全部页面以原生分辨率 RGB 驻留内存
+    # （300张1080p 峰值约 1.7GiB，弱机 OOM/换页卡死）。PDF 供阅读不需要
+    # 原生分辨率——统一降采样到最长边 1600 再驻留，峰值降约一个数量级。
+    MAX_SIDE = 1600
     first_img = None
     append_imgs = []
     try:
         for img_path in images:
             img = Image.open(img_path).convert('RGB')
+            if max(img.size) > MAX_SIDE:
+                img.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
             if first_img is None:
                 first_img = img
             else:

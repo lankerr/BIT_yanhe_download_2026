@@ -82,9 +82,16 @@ def _thread_excepthook(args):
     import traceback
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _log_line(
-        f"[{stamp}] THREAD {args.name if args.thread else '?'} "
+        f"[{stamp}] THREAD {getattr(args.thread, 'name', '?')} "
         f"{args.exc_type.__name__}: {args.exc_value}\n"
-        + "".join(traceback.format_tb(args.exc_tb)))
+        + "".join(traceback.format_tb(args.exc_traceback)))
+
+
+def persist(tag: str, text: str) -> str:
+    """把异常/诊断文本写入会话日志（GUI 捕获点显式落盘用），返回日志路径。"""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _log_line(f"[{stamp}] {tag}\n{text}")
+    return _LOG_FILE or ""
 
 
 def initialize() -> dict:
