@@ -2002,6 +2002,13 @@ class PostProcessFrame(ctk.CTkFrame):
             else:
                 self.device_var.set("cpu")
                 self.compute_var.set("int8")
+                # 核显轻薄本：课件档默认降 fast（balanced 在弱CPU上单讲可跑
+                # 数十分钟且高概率把UI拖到黑屏）
+                try:
+                    if self.slide_profile_var.get() == "balanced":
+                        self.slide_profile_var.set("fast")
+                except Exception:
+                    pass
         try:
             post(apply)
         except RuntimeError:
@@ -2039,6 +2046,16 @@ class PostProcessFrame(ctk.CTkFrame):
         self._log("开始处理...")
 
         def worker():
+            # 弱CPU轻薄本防"窗口黑屏"：提取/转录是重CPU循环，会把GIL/调度打满，
+            # tkinter主线程抢不到时间片 → 窗口停止重绘被Windows涂黑（无报错）。
+            # 把本worker线程降到 BelowNormal 优先级，主线程恒赢调度；多核机上
+            # 提取速度几乎不受影响。
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadPriority(
+                    ctypes.windll.kernel32.GetCurrentThread(), -1)  # THREAD_PRIORITY_BELOW_NORMAL
+            except Exception:
+                pass
             try:
                 import batch_process
 
@@ -2093,8 +2110,18 @@ class PostProcessFrame(ctk.CTkFrame):
                     "pip install faster-whisper tqdm imagehash python-pptx"
                 ))
             except Exception as e:
-                post(lambda e=e: self._log(f"❌ 处理失败: {e}"))
-                post(lambda e=e: messagebox.showerror("处理失败", str(e)[:300]))
+                tb = traceback.format_exc()
+                lines = [f"❌ 处理失败: {e}"] + ["    " + l for l in tb.strip().splitlines()[-8:]]
+                try:
+                    from runtime_diagnostics import get_log_file
+                    lines.append(f"完整堆栈已存: {get_log_file()}")
+                except Exception:
+                    pass
+                for msg in lines:
+                    post(lambda m=msg: self._log(m))
+                post(lambda e=e, tb=tb: messagebox.showerror(
+                    "处理失败", f"{e}\n\n{tb.strip().splitlines()[-1] if tb else ''}\n\n"
+                    "完整日志见 %LOCALAPPDATA%\\yanhe\\log"))
             finally:
                 post(lambda: self.start_btn.configure(state="normal", text="开始处理"))
                 post(lambda: self.stop_btn.configure(state="disabled"))
